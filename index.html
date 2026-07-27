@@ -75,8 +75,11 @@
     </div>
   </div>
 
-  <!-- Supabase official CDN client -->
-  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-  <script src="js.js"></script>
+  <!-- Supabase official CDN client — loaded async so it can NEVER block or delay
+       the game itself. If this fails to load for any reason (ad blocker,
+       network issue, offline), the game still works; only score-saving and
+       the online leaderboard are affected. -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2" async></script>
+  <script src="js.js" defer></script>
 </body>
 </html>
