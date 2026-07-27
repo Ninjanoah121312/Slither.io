@@ -1,6 +1,41 @@
 "use strict";
 
 /* =========================================================================
+   SECTION: GLOBAL SAFETY NET
+   If ANY uncaught error happens anywhere in this file (including during
+   script parse/execution before our own try/catches even exist), show it
+   directly on the page. This turns "nothing happens when I click" into a
+   visible, actionable message instead of a silent dead page.
+   ========================================================================= */
+(function setupGlobalErrorNet() {
+  function showFatalError(message) {
+    try {
+      let box = document.getElementById("__fatalErrorBox");
+      if (!box) {
+        box = document.createElement("div");
+        box.id = "__fatalErrorBox";
+        box.style.cssText = [
+          "position:fixed", "top:0", "left:0", "right:0", "z-index:99999",
+          "background:#4a0d0d", "color:#ffdada", "font-family:monospace",
+          "font-size:13px", "padding:12px 16px", "border-bottom:2px solid #ff6b6b",
+          "white-space:pre-wrap", "max-height:40vh", "overflow:auto"
+        ].join(";");
+        document.body.appendChild(box);
+      }
+      box.textContent = "Game error (check browser console for full details):\n" + message;
+    } catch (e) {
+      // If even this fails, there is nothing more we can do client-side.
+    }
+  }
+  window.addEventListener("error", (e) => {
+    showFatalError((e.message || "Unknown error") + (e.filename ? ("\n" + e.filename + ":" + e.lineno) : ""));
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    showFatalError("Unhandled promise rejection: " + (e.reason && e.reason.message ? e.reason.message : e.reason));
+  });
+})();
+
+/* =========================================================================
    SECTION: SUPABASE
    ========================================================================= */
 const SUPABASE_URL = "https://jvcbtbvgptssoqimfpbn.supabase.co";
@@ -679,48 +714,83 @@ function setupMenuUI() {
   const modePvA = document.getElementById("modePvA");
   const modeOnline = document.getElementById("modeOnline");
 
-  modePvA.addEventListener("click", () => {
-    modePvA.classList.add("active");
-    modeOnline.classList.remove("active");
-  });
+  // Each binding is wrapped independently: if one control is missing or a
+  // listener throws, it must not prevent the Play button (or anything else)
+  // from being wired up.
+
+  try {
+    if (modePvA && modeOnline) {
+      modePvA.addEventListener("click", () => {
+        modePvA.classList.add("active");
+        modeOnline.classList.remove("active");
+      });
+    }
+  } catch (err) {
+    console.error("Failed to bind mode buttons:", err);
+  }
 
   // modeOnline is disabled; clicking does nothing (Coming Soon)
 
-  // difficulty buttons
-  const diffBtns = document.querySelectorAll(".diff-btn");
-  diffBtns.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      diffBtns.forEach((b) => b.classList.remove("active"));
-      btn.classList.add("active");
-      currentDifficulty = btn.dataset.difficulty;
+  try {
+    const diffBtns = document.querySelectorAll(".diff-btn");
+    diffBtns.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        diffBtns.forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+        currentDifficulty = btn.dataset.difficulty;
+      });
     });
-  });
+  } catch (err) {
+    console.error("Failed to bind difficulty buttons:", err);
+  }
 
-  playBtn.addEventListener("click", () => {
-    const name = nameInput.value.trim();
-    if (!name) {
-      nameInput.focus();
-      nameInput.style.borderColor = "#ff6b6b";
-      setTimeout(() => { nameInput.style.borderColor = ""; }, 900);
-      return;
+  try {
+    if (playBtn && nameInput) {
+      playBtn.addEventListener("click", () => {
+        const name = nameInput.value.trim();
+        if (!name) {
+          nameInput.focus();
+          nameInput.style.borderColor = "#ff6b6b";
+          setTimeout(() => { nameInput.style.borderColor = ""; }, 900);
+          return;
+        }
+        playerName = name.slice(0, 16);
+        startGame();
+      });
+    } else {
+      console.error("Play button or name input not found in DOM. Check element IDs 'playBtn' and 'nameInput'.");
     }
-    playerName = name.slice(0, 16);
-    startGame();
-  });
+  } catch (err) {
+    console.error("Failed to bind Play button:", err);
+  }
 
-  nameInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") playBtn.click();
-  });
+  try {
+    if (nameInput && playBtn) {
+      nameInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") playBtn.click();
+      });
+    }
+  } catch (err) {
+    console.error("Failed to bind Enter-key shortcut:", err);
+  }
 }
 
 function setupDeathUI() {
-  const respawnBtn = document.getElementById("respawnBtn");
-  respawnBtn.addEventListener("click", () => {
-    deathScreenEl().classList.add("hidden");
-    menuEl().classList.remove("hidden");
-    gameUIEl().classList.add("hidden");
-    gameRunning = false;
-  });
+  try {
+    const respawnBtn = document.getElementById("respawnBtn");
+    if (respawnBtn) {
+      respawnBtn.addEventListener("click", () => {
+        deathScreenEl().classList.add("hidden");
+        menuEl().classList.remove("hidden");
+        gameUIEl().classList.add("hidden");
+        gameRunning = false;
+      });
+    } else {
+      console.error("Respawn button not found in DOM. Check element ID 'respawnBtn'.");
+    }
+  } catch (err) {
+    console.error("Failed to bind respawn button:", err);
+  }
 }
 
 function showDeathScreen() {
