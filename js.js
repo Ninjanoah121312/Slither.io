@@ -73,14 +73,29 @@ async function saveScore(name, score, boops) {
     return;
   }
   try {
-    await client.from("Data").insert({
+    // NOTE: Supabase JS v2 does NOT throw for most failures (including RLS
+    // policy rejections) — it resolves normally and returns { error }
+    // instead. Awaiting without checking `error` is why a save could fail
+    // completely silently with no console output at all.
+    const { error } = await client.from("Data").insert({
       name: name,
       score: Math.round(score),
       boops: Math.round(boops),
       score_time: new Date().toISOString()
     });
+    if (error) {
+      console.error(
+        "Supabase insert failed:", error.message || error,
+        "\nMost common cause: Row Level Security (RLS) on the 'Data' table " +
+        "is blocking anonymous INSERT. In the Supabase dashboard, check " +
+        "Authentication > Policies for the Data table and ensure there is " +
+        "a policy allowing INSERT for the 'anon' role."
+      );
+    } else {
+      console.log("Score saved to Supabase successfully.");
+    }
   } catch (err) {
-    console.error("Failed to save score:", err);
+    console.error("Failed to save score (network/client exception):", err);
   }
 }
 
@@ -94,7 +109,12 @@ async function fetchLeaderboard() {
       .order("score", { ascending: false })
       .limit(10);
     if (error) {
-      console.error("Leaderboard fetch error:", error);
+      console.error(
+        "Leaderboard fetch failed:", error.message || error,
+        "\nMost common cause: Row Level Security (RLS) on the 'Data' table " +
+        "is blocking anonymous SELECT. Check Authentication > Policies in " +
+        "the Supabase dashboard for a policy allowing SELECT for 'anon'."
+      );
       return [];
     }
     return data || [];
@@ -116,28 +136,35 @@ const FOOD_MAX_RADIUS = 8;
 
 const AI_COUNT = 12;
 
-const BASE_SPEED = 2.6;
-const BOOST_SPEED = 4.8;
-const TURN_RATE = 0.09;           // max radians per frame the head can turn
+// Speeds are in pixels PER SECOND (not per frame) so movement is
+// framerate-independent via delta time. At 60fps these match the original
+// feel (2.6px/frame * 60 = 156, 4.8px/frame * 60 = 288).
+const BASE_SPEED = 156;
+const BOOST_SPEED = 288;
+const TURN_RATE = 5.4;            // max radians PER SECOND the head can turn (0.09 * 60)
 const BASE_SEGMENT_SPACING = 6.5;
 const BASE_HEAD_RADIUS = 10;
 
 const START_LENGTH = 12;          // number of segments at start
-const GROWTH_PER_FOOD = 2;
+const GROWTH_PER_FOOD = 2;        // segments gained per food eaten (this IS length growth)
+const SCORE_PER_FOOD = 10;        // points gained per food eaten (score is independent of length)
+const SCORE_PER_KILL = 50;        // bonus points awarded to whoever kills another snake
+const BOOPS_PER_KILL = 1;         // boops awarded to the killer per kill (separate from food boops)
 
 const MAX_THICKNESS_LENGTH = 900; // length at which thickness caps out
 const MIN_RADIUS_MULT = 1.0;
 const MAX_RADIUS_MULT = 2.6;
 
-const BOOST_LENGTH_COST = 0.06;   // length lost per frame while boosting
+const BOOST_LENGTH_COST = 3.6;    // length lost per second while boosting (0.06 * 60)
 const MIN_BOOST_LENGTH = 16;
 
 const CAMERA_LERP = 0.08;
 const ZOOM_MIN = 0.55;
 const ZOOM_MAX = 1.15;
 
-const COLLISION_CHECK_STEP = 2;   // check every Nth body segment for perf
-const SELF_COLLISION_SKIP = 10;   // skip first N segments near own head
+const COLLISION_CHECK_STEP = 1;   // check every body segment (needed for reliable hit detection)
+const SELF_COLLISION_BUFFER = 90; // ignore own segments closer than this real distance behind the head,
+                                   // so normal tight turns never self-kill you
 
 const SNAKE_COLORS = [
   ["#4fd6ff", "#1a9fd6"],
@@ -344,19 +371,29 @@ class Snake {
     this.score = 0;
     this.boops = 0;
 
-    this.segments = [];
-    for (let i = 0; i < START_LENGTH; i++) {
-      this.segments.push({
-        x: x - Math.cos(this.angle) * i * BASE_SEGMENT_SPACING,
-        y: y - Math.sin(this.angle) * i * BASE_SEGMENT_SPACING
+    // this.path: raw high-resolution history of every point the head has
+    // visited (much denser than the visible body). this.segments: the
+    // visible/collidable body, derived from this.path at fixed spacing —
+    // see rebuildSegmentsFromPath(). this.segmentCount is the "true" body
+    // length in segments; this.segments.length always matches it.
+    this.segmentCount = START_LENGTH;
+    this.path = [];
+    const pathPoints = START_LENGTH * 6; // dense enough to derive segments smoothly
+    for (let i = 0; i < pathPoints; i++) {
+      this.path.push({
+        x: x - Math.cos(this.angle) * i * (BASE_SEGMENT_SPACING / 6),
+        y: y - Math.sin(this.angle) * i * (BASE_SEGMENT_SPACING / 6)
       });
     }
+    this.segments = [];
+    this.rebuildSegmentsFromPath();
+
     this.growthRemaining = 0;
     this.eyeBlink = 0;
   }
 
   get headRadius() {
-    const t = Math.min(1, this.segments.length / MAX_THICKNESS_LENGTH);
+    const t = Math.min(1, this.segmentCount / MAX_THICKNESS_LENGTH);
     const mult = MIN_RADIUS_MULT + t * (MAX_RADIUS_MULT - MIN_RADIUS_MULT);
     return BASE_HEAD_RADIUS * mult;
   }
@@ -365,74 +402,141 @@ class Snake {
     return BASE_SEGMENT_SPACING * (this.headRadius / BASE_HEAD_RADIUS) * 0.9;
   }
 
-  // Turn head angle smoothly toward targetAngle, respecting TURN_RATE
-  applyTurn() {
+  // Turn head angle smoothly toward targetAngle, respecting TURN_RATE (radians/sec)
+  applyTurn(dtSeconds) {
     let diff = this.targetAngle - this.angle;
     while (diff > Math.PI) diff -= Math.PI * 2;
     while (diff < -Math.PI) diff += Math.PI * 2;
-    const maxTurn = TURN_RATE;
+    const maxTurn = TURN_RATE * dtSeconds;
     if (diff > maxTurn) diff = maxTurn;
     if (diff < -maxTurn) diff = -maxTurn;
     this.angle += diff;
   }
 
-  move() {
-    this.applyTurn();
+  // dt is elapsed time in milliseconds since the last frame. All motion is
+  // computed from real elapsed time so the game runs at the same speed on
+  // any framerate/monitor refresh rate instead of being tied to frame count.
+  //
+  // Implementation note: we keep a raw high-resolution path (this.path) of
+  // every point the head has visited, then derive the visible/collidable
+  // body segments from that path at fixed arc-length spacing. This keeps
+  // segment spacing constant regardless of how far the head moves per frame.
+  move(dt) {
+    const dtSeconds = Math.min(dt, 100) / 1000; // clamp to avoid huge jumps after tab-switch lag
 
-    const canBoost = this.segments.length > MIN_BOOST_LENGTH;
+    this.applyTurn(dtSeconds);
+
+    const canBoost = this.segmentCount > MIN_BOOST_LENGTH;
     const boosting = this.boosting && canBoost;
     const speedMult = this.isPlayer ? 1 : getDifficulty().aggressionSpeedMult;
     this.speed = (boosting ? BOOST_SPEED : BASE_SPEED) * speedMult;
 
-    const head = this.segments[0];
-    const nx = head.x + Math.cos(this.angle) * this.speed;
-    const ny = head.y + Math.sin(this.angle) * this.speed;
+    const head = this.path[0];
+    const moveDist = this.speed * dtSeconds;
+    const nx = head.x + Math.cos(this.angle) * moveDist;
+    const ny = head.y + Math.sin(this.angle) * moveDist;
 
     // clamp to world bounds (soft wall - bounce angle)
     const half = WORLD_SIZE / 2;
-    let clampedX = nx, clampedY = ny;
-    let bounced = false;
-    if (nx < -half || nx > half) { this.targetAngle = Math.PI - this.angle; bounced = true; }
-    if (ny < -half || ny > half) { this.targetAngle = -this.angle; bounced = true; }
-    clampedX = Math.max(-half, Math.min(half, nx));
-    clampedY = Math.max(-half, Math.min(half, ny));
+    if (nx < -half || nx > half) { this.targetAngle = Math.PI - this.angle; }
+    if (ny < -half || ny > half) { this.targetAngle = -this.angle; }
+    const clampedX = Math.max(-half, Math.min(half, nx));
+    const clampedY = Math.max(-half, Math.min(half, ny));
 
-    this.segments.unshift({ x: clampedX, y: clampedY });
+    this.path.unshift({ x: clampedX, y: clampedY });
 
-    // handle growth: only remove tail if not growing
+    // growth: more segments = longer body
     if (this.growthRemaining > 0) {
+      this.segmentCount += 1;
       this.growthRemaining -= 1;
-    } else {
-      this.segments.pop();
     }
 
-    // boosting shrinks the snake slowly (classic slither mechanic)
-    if (boosting && this.segments.length > MIN_BOOST_LENGTH) {
-      this._boostAccum = (this._boostAccum || 0) + BOOST_LENGTH_COST;
+    // boosting shrinks the snake slowly (classic slither mechanic), scaled by real time
+    if (boosting && this.segmentCount > MIN_BOOST_LENGTH) {
+      this._boostAccum = (this._boostAccum || 0) + BOOST_LENGTH_COST * dtSeconds;
       if (this._boostAccum >= 1) {
-        this.segments.pop();
-        this._boostAccum = 0;
-        // dropped mass becomes small food behind the tail
-        const tail = this.segments[this.segments.length - 1];
-        if (tail) spawnFood(tail.x, tail.y, FOOD_MIN_RADIUS + 1, this.color1, 1);
+        const dropCount = Math.floor(this._boostAccum);
+        this._boostAccum -= dropCount;
+        this.segmentCount = Math.max(MIN_BOOST_LENGTH, this.segmentCount - dropCount);
       }
     }
 
-    this.eyeBlink += 0.08;
+    // trim raw path history to what's actually needed for current body length
+    const maxPathLen = Math.ceil(this.segmentCount * this.segmentSpacing) + 40;
+    if (this.path.length > maxPathLen) this.path.length = maxPathLen;
+
+    // derive evenly-spaced body segments from the raw path by arc length
+    this.rebuildSegmentsFromPath();
+
+    // drop a bit of food behind the tail while boosting (visual/gameplay feedback)
+    if (boosting && this.segmentCount > MIN_BOOST_LENGTH && Math.random() < dtSeconds * 6) {
+      const tail = this.segments[this.segments.length - 1];
+      if (tail) spawnFood(tail.x, tail.y, FOOD_MIN_RADIUS + 1, this.color1, 1);
+    }
+
+    this.eyeBlink += dtSeconds * 5;
+  }
+
+  // Walk the raw path and place body segments at fixed arc-length intervals,
+  // starting from the head. This is what gets rendered and used for
+  // collision, and its point count always matches this.segmentCount.
+  rebuildSegmentsFromPath() {
+    const spacing = this.segmentSpacing;
+    const path = this.path;
+    const result = [path[0]];
+    let prev = path[0];
+    let accum = 0;
+    let idx = 1;
+
+    while (result.length < this.segmentCount) {
+      if (idx >= path.length) {
+        // ran out of recorded path (can happen briefly right after spawn or
+        // a big growth spike) — pad with the last known point rather than crash
+        result.push(path[path.length - 1]);
+        continue;
+      }
+      const cur = path[idx];
+      const dx = cur.x - prev.x, dy = cur.y - prev.y;
+      const segDist = Math.hypot(dx, dy);
+      if (segDist < 1e-6) { idx++; continue; }
+      if (accum + segDist >= spacing) {
+        const t = (spacing - accum) / segDist;
+        const px = prev.x + dx * t;
+        const py = prev.y + dy * t;
+        result.push({ x: px, y: py });
+        prev = { x: px, y: py };
+        accum = 0;
+      } else {
+        accum += segDist;
+        prev = cur;
+        idx++;
+      }
+    }
+
+    this.segments = result;
   }
 
   grow(amount) {
     this.growthRemaining += amount;
   }
 
+  // foodValue affects score only; length always grows by a fixed amount per
+  // food so score and length are independent stats.
   eat(foodValue) {
-    this.score += foodValue * 10;
+    this.score += foodValue * SCORE_PER_FOOD;
     this.boops += 1;
     this.grow(GROWTH_PER_FOOD);
   }
 
+  // Call this on whoever gets credit for a kill. Kept separate from eat()
+  // since kills award a fixed bonus regardless of the victim's size.
+  registerKill() {
+    this.score += SCORE_PER_KILL;
+    this.boops += BOOPS_PER_KILL;
+  }
+
   get length() {
-    return this.segments.length;
+    return this.segmentCount;
   }
 }
 
@@ -449,7 +553,8 @@ class AISnake extends Snake {
     this.huntTargetIsPlayer = false;
   }
 
-  think(allSnakes) {
+  think(allSnakes, dt) {
+    const dtSeconds = Math.min(dt, 100) / 1000;
     const diff = getDifficulty();
     const head = this.segments[0];
 
@@ -509,9 +614,9 @@ class AISnake extends Snake {
       const sizeOk = this.segments.length + 20 > player.segments.length * 0.5 || currentDifficulty === "hard";
 
       if (this.huntCommit > 0) {
-        this.huntCommit -= 1;
+        this.huntCommit -= dtSeconds;
       } else if (inRange && sizeOk && Math.random() < diff.huntChance) {
-        this.huntCommit = 90 + Math.random() * 120;
+        this.huntCommit = 1.5 + Math.random() * 2; // seconds committed to the chase
       }
 
       if (this.huntCommit > 0 && inRange) {
@@ -546,10 +651,10 @@ class AISnake extends Snake {
       desiredAngle = Math.atan2(closestFood.y - head.y, closestFood.x - head.x);
       this.state = "seek";
     } else {
-      this.wanderTimer -= 1;
+      this.wanderTimer -= dtSeconds;
       if (this.wanderTimer <= 0) {
         this.wanderAngle = this.angle + (Math.random() - 0.5) * 1.4;
-        this.wanderTimer = 40 + Math.random() * 60;
+        this.wanderTimer = 0.67 + Math.random() * 1.0; // seconds until next wander direction change
       }
       desiredAngle = this.wanderAngle;
       this.state = "wander";
@@ -564,12 +669,15 @@ class AISnake extends Snake {
 
     this.targetAngle = desiredAngle;
 
-    // boost behavior depends on state and difficulty aggression
+    // boost behavior depends on state and difficulty aggression.
+    // Probabilities were tuned assuming ~60 checks/sec, so scale by dt to
+    // keep the actual boost frequency constant regardless of framerate.
+    const frameNormalizer = dtSeconds * 60;
     if (this.segments.length > 60) {
       if (this.state === "hunt") {
-        this.boosting = Math.random() < diff.boostChanceHunt;
+        this.boosting = Math.random() < diff.boostChanceHunt * frameNormalizer;
       } else if (this.state === "seek") {
-        this.boosting = Math.random() < diff.boostChanceSeek;
+        this.boosting = Math.random() < diff.boostChanceSeek * frameNormalizer;
       } else {
         this.boosting = false;
       }
@@ -587,9 +695,15 @@ function distSq(ax, ay, bx, by) {
   return dx * dx + dy * dy;
 }
 
-function killSnake(snake) {
+function killSnake(snake, killer) {
   snake.alive = false;
   dropFoodAlongPath(snake);
+
+  // Award the kill to whoever caused it (if anyone did — e.g. running into
+  // the world border or a bug-free edge case has no killer).
+  if (killer && killer.alive && killer !== snake) {
+    killer.registerKill();
+  }
 
   if (snake.isPlayer) {
     onPlayerDeath();
@@ -614,19 +728,21 @@ function checkCollisions() {
       }
     }
 
-    // snake-vs-snake body collisions
+    // snake-vs-snake body collisions. A snake's own body is intentionally
+    // NOT lethal (matches real slither.io behavior and the original spec:
+    // "the player's own body should not instantly kill itself") — a long
+    // snake naturally coils back near its own head during normal tight
+    // turns, and treating that as death felt like dying "out of nowhere".
     for (let other of allSnakes) {
-      if (!other.alive) continue;
+      if (!other.alive || other === snake) continue;
       const segs = other.segments;
-      const isSelf = other === snake;
-      const startIdx = isSelf ? SELF_COLLISION_SKIP : 1; // skip other's own head vs itself
       const otherR = other.headRadius;
 
-      for (let i = startIdx; i < segs.length; i += COLLISION_CHECK_STEP) {
+      for (let i = 1; i < segs.length; i += COLLISION_CHECK_STEP) {
         const seg = segs[i];
         const rr = (headR * 0.8 + otherR * 0.8);
         if (distSq(head.x, head.y, seg.x, seg.y) < rr * rr) {
-          killSnake(snake);
+          killSnake(snake, other);
           break;
         }
       }
@@ -1034,12 +1150,12 @@ function updatePlayerInput() {
 function gameStep(dt) {
   updatePlayerInput();
 
-  if (player && player.alive) player.move();
+  if (player && player.alive) player.move(dt);
 
   for (let ai of aiSnakes) {
     if (!ai.alive) continue;
-    ai.think([player, ...aiSnakes]);
-    ai.move();
+    ai.think([player, ...aiSnakes], dt);
+    ai.move(dt);
   }
 
   checkCollisions();
