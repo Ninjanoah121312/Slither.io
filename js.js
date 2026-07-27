@@ -37,28 +37,37 @@
 
 /* =========================================================================
    SECTION: SUPABASE
+   Since the Supabase CDN script now loads with `async`, we can't assume it
+   has finished loading by the time this file runs. The client is created
+   lazily on first actual use (save/fetch), and re-checked every time, so it
+   works whenever the CDN script happens to finish — and never blocks or
+   breaks the rest of the game if it's slow, blocked, or fails entirely.
    ========================================================================= */
 const SUPABASE_URL = "https://jvcbtbvgptssoqimfpbn.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_DhMMBuISLiMGWDt-Xj42HQ_0820RWBZ";
 
-// Defensive init: if the CDN script failed to load or throws, we must NOT let
-// it kill the rest of this file (that would silently break the Play button).
 let supabase = null;
-try {
-  if (window.supabase && typeof window.supabase.createClient === "function") {
-    supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-  } else {
-    console.warn("Supabase CDN client not found on window. Leaderboard/save will be disabled.");
+function getSupabaseClient() {
+  if (supabase) return supabase;
+  try {
+    if (window.supabase && typeof window.supabase.createClient === "function") {
+      supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+      return supabase;
+    }
+  } catch (err) {
+    console.error("Supabase init failed:", err);
   }
-} catch (err) {
-  console.error("Supabase init failed:", err);
-  supabase = null;
+  return null;
 }
 
 async function saveScore(name, score, boops) {
-  if (!supabase) return;
+  const client = getSupabaseClient();
+  if (!client) {
+    console.warn("Supabase unavailable; score was not saved online.");
+    return;
+  }
   try {
-    await supabase.from("Data").insert({
+    await client.from("Data").insert({
       name: name,
       score: Math.round(score),
       boops: Math.round(boops),
@@ -70,9 +79,10 @@ async function saveScore(name, score, boops) {
 }
 
 async function fetchLeaderboard() {
-  if (!supabase) return [];
+  const client = getSupabaseClient();
+  if (!client) return [];
   try {
-    const { data, error } = await supabase
+    const { data, error } = await client
       .from("Data")
       .select("*")
       .order("score", { ascending: false })
