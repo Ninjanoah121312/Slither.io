@@ -42,17 +42,23 @@
    lazily on first actual use (save/fetch), and re-checked every time, so it
    works whenever the CDN script happens to finish — and never blocks or
    breaks the rest of the game if it's slow, blocked, or fails entirely.
+
+   IMPORTANT: our own variable must NOT be named "supabase" — the Supabase
+   CDN script itself declares a top-level global called "supabase", and
+   having a `let`/`const supabase` here collides with it, causing:
+   "Uncaught SyntaxError: Identifier 'supabase' has already been declared".
+   We name ours "supabaseClient" instead to avoid any possibility of that.
    ========================================================================= */
 const SUPABASE_URL = "https://jvcbtbvgptssoqimfpbn.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_DhMMBuISLiMGWDt-Xj42HQ_0820RWBZ";
 
-let supabase = null;
+let supabaseClient = null;
 function getSupabaseClient() {
-  if (supabase) return supabase;
+  if (supabaseClient) return supabaseClient;
   try {
     if (window.supabase && typeof window.supabase.createClient === "function") {
-      supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-      return supabase;
+      supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+      return supabaseClient;
     }
   } catch (err) {
     console.error("Supabase init failed:", err);
