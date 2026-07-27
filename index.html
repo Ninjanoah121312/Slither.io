@@ -8,7 +8,6 @@
 </head>
 <body>
 
-  <!-- ===================== MAIN MENU ===================== -->
   <div id="menu">
     <div class="menu-box">
       <h1 class="title">SLITHER<span>.CLONE</span></h1>
@@ -32,53 +31,70 @@
         </div>
       </div>
 
+      <div id="qualityWrap" class="difficulty-select">
+        <p class="diff-label">Graphics</p>
+        <div class="diff-btns">
+          <button class="quality-btn active" data-quality="high">High Quality</button>
+          <button class="quality-btn" data-quality="low">Low Quality</button>
+        </div>
+      </div>
+
       <button id="playBtn" class="play-btn">PLAY</button>
 
+      <div class="stats-row">
+        <div class="stats-box">
+          <h3>Last Game</h3>
+          <div class="stats-line"><span>Length</span><strong id="lastLength">-</strong></div>
+          <div class="stats-line"><span>Boops</span><strong id="lastBoops">-</strong></div>
+          <div class="stats-line"><span>When</span><strong id="lastWhen">-</strong></div>
+        </div>
+        <div class="stats-box">
+          <h3>Best Game</h3>
+          <div class="stats-line"><span>Length</span><strong id="bestLength">-</strong></div>
+          <div class="stats-line"><span>Boops</span><strong id="bestBoops">-</strong></div>
+          <div class="stats-line"><span>When</span><strong id="bestWhen">-</strong></div>
+        </div>
+      </div>
+
       <div class="menu-leaderboard">
-        <h3>🏆 Top Scores</h3>
+        <h3>Top Scores</h3>
         <ol id="menuLeaderboardList"><li class="lb-empty">Loading...</li></ol>
       </div>
 
-      <p class="hint">Move the mouse to steer. Click / hold Space to boost.</p>
+      <p class="hint">Move the mouse to steer. Hold Space or click to boost.</p>
     </div>
   </div>
 
-  <!-- ===================== GAME UI ===================== -->
   <div id="gameUI" class="hidden">
     <canvas id="gameCanvas"></canvas>
 
     <div id="hud">
-      <div class="hud-panel stats-panel">
-        <div class="stat"><span class="label">Score</span><span id="scoreVal">0</span></div>
-        <div class="stat"><span class="label">Length</span><span id="lengthVal">0</span></div>
-        <div class="stat"><span class="label">FPS</span><span id="fpsVal">0</span></div>
-        <div class="stat"><span class="label">Mode</span><span id="diffVal">-</span></div>
-      </div>
-
       <div class="hud-panel leaderboard-panel">
         <h3>Leaderboard</h3>
         <ol id="liveLeaderboardList"></ol>
       </div>
     </div>
 
+    <div id="rankReadout">
+      <div>Your length: <strong id="rankLengthVal">0</strong></div>
+      <div>Your rank: <strong id="rankPositionVal">- of -</strong></div>
+    </div>
+
     <div id="minimapWrap">
       <canvas id="minimap"></canvas>
+      <div id="serverLabel">server 4369</div>
     </div>
   </div>
 
-  <!-- ===================== DEATH SCREEN ===================== -->
   <div id="deathScreen" class="hidden">
     <div class="death-box">
-      <h2>You Died</h2>
+      <h2 class="deathTitle">slither<span>.io</span></h2>
       <p id="deathStats"></p>
-      <button id="respawnBtn" class="play-btn">BACK TO MENU</button>
+      <input id="respawnNameInput" type="text" maxlength="16" placeholder="Nickname" autocomplete="off">
+      <button id="respawnBtn" class="play-btn">Play Again</button>
     </div>
   </div>
 
-  <!-- Supabase official CDN client — loaded async so it can NEVER block or delay
-       the game itself. If this fails to load for any reason (ad blocker,
-       network issue, offline), the game still works; only score-saving and
-       the online leaderboard are affected. -->
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2" async></script>
   <script src="js.js" defer></script>
 </body>
