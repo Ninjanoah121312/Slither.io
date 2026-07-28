@@ -13,10 +13,11 @@
       <h1 class="title">SLITHER<span>.CLONE</span></h1>
       <p class="subtitle">Eat, grow, survive.</p>
 
-      <input id="nameInput" type="text" maxlength="16" placeholder="Enter your name" autocomplete="off">
+      <input id="nameInput" type="text" maxlength="16" placeholder="Nickname (optional)" autocomplete="off">
 
       <div class="mode-select">
         <button id="modePvA" class="mode-btn active" data-mode="pva">Player vs AI</button>
+        <button id="modeTopLeaderboard" class="mode-btn" data-mode="top">Top 10 Leaderboard</button>
         <button id="modeOnline" class="mode-btn disabled" data-mode="online" disabled>
           Slither Online <span class="soon">Coming Soon</span>
         </button>
@@ -86,14 +87,15 @@
     </div>
   </div>
 
-  <div id="deathScreen" class="hidden">
-    <div class="death-box">
-      <h2 class="deathTitle">slither<span>.io</span></h2>
-      <p id="deathStats"></p>
-      <input id="respawnNameInput" type="text" maxlength="16" placeholder="Nickname" autocomplete="off">
-      <button id="respawnBtn" class="play-btn">Play Again</button>
+  <div id="topLeaderboardOverlay" class="hidden">
+    <div class="top-lb-box">
+      <h2>Top 10 - Best Length</h2>
+      <ol id="topLeaderboardList"><li class="lb-empty">Loading...</li></ol>
+      <button id="closeTopLeaderboard" class="play-btn">Close</button>
     </div>
   </div>
+
+  <div id="deathScreen" class="hidden"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2" async></script>
   <script src="js.js" defer></script>
