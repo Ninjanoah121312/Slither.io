@@ -75,12 +75,7 @@ function setLocalUuid(uuidNumber) {
 }
 
 function generateCandidateUuid() {
-  let s = "";
-  s += (1 + Math.floor(Math.random() * 9));
-  for (let i = 0; i < 49; i++) {
-    s += Math.floor(Math.random() * 10);
-  }
-  return parseInt(s.slice(0, 15), 10);
+  return 1 + Math.floor(Math.random() * 2147483646);
 }
 
 async function ensureUniqueUuid() {
@@ -265,15 +260,16 @@ async function fetchBestLeaderboard() {
   }
 }
 
-const WORLD_SIZE = 120000;
-const WORLD_RADIUS_MAX = 60000;
-const WORLD_RADIUS_MIN = 20000;
+const WORLD_SIZE = 60000;
+const WORLD_RADIUS_MAX = 30000;
+const WORLD_RADIUS_MIN = 10000;
 
 const FOOD_MIN_RADIUS = 4;
 const FOOD_MAX_RADIUS = 10;
 const FOOD_MIN_VALUE = 1;
 const FOOD_MAX_VALUE = 10;
-const FOOD_DENSITY_PER_AREA = 0.00009;
+const FOOD_DENSITY_PER_AREA = 0.00045;
+const FOOD_MAX_CAP = 6000;
 const FOOD_WOBBLE_RADIUS = 8;
 const FOOD_WOBBLE_SPEED = 0.6;
 
@@ -326,7 +322,24 @@ const AI_NAME_BASES = [
   "Wriggler", "Noodle", "Fang", "Slick", "Viper", "Twister",
   "Zoomie", "Chomper", "Gobbler", "Coil", "Dash", "Squiggle",
   "Muncher", "Serpi", "Blip", "Nibbler", "Sassy", "Live",
-  "Rony", "Butcher", "Maomao", "Sousou"
+  "Rony", "Butcher", "Maomao", "Sousou",
+  "Slither", "Cobra", "Python", "Mamba", "Boa", "Adder", "Anaconda",
+  "Rattler", "Sidewinder", "Copperhead", "Krait", "Taipan", "Vine",
+  "Ribbon", "Whip", "Lasher", "Tangle", "Curl", "Spiral", "Loop",
+  "Zigzag", "Weave", "Snap", "Bolt", "Flash", "Streak", "Blitz",
+  "Turbo", "Rocket", "Comet", "Meteor", "Nova", "Blaze", "Ember",
+  "Frost", "Glacier", "Storm", "Thunder", "Cyclone", "Tornado",
+  "Quake", "Ripple", "Wave", "Current", "Undertow", "Tide",
+  "Shadow", "Ghost", "Phantom", "Specter", "Wraith", "Reaper",
+  "Fang2", "Venom", "Toxin", "Poison", "Sting", "Bite", "Snare",
+  "Trap", "Hunter", "Stalker", "Prowler", "Predator", "Scout",
+  "Rogue", "Bandit", "Outlaw", "Renegade", "Maverick", "Nomad",
+  "Wanderer", "Drifter", "Rambler", "Roamer", "Voyager", "Pioneer",
+  "Titan", "Colossus", "Behemoth", "Juggernaut", "Goliath", "Atlas",
+  "Apex", "Zenith", "Summit", "Peak", "Crest", "Pinnacle",
+  "Glimmer", "Sparkle", "Shine", "Glow", "Radiance", "Luster",
+  "Mystic", "Oracle", "Sage", "Seer", "Wizard", "Sorcerer",
+  "Ace", "Champ", "Legend", "Icon", "Rookie", "Veteran"
 ];
 
 function makeAIName() {
@@ -441,7 +454,7 @@ function setupInput() {
 
 function zoomForLength(length) {
   const t = Math.min(1, Math.max(0, (length - START_LENGTH) / 2000));
-  return 1.15 - t * 0.75;
+  return 2.3 - t * 1.5;
 }
 
 function updateCamera(target) {
@@ -712,6 +725,39 @@ class AISnake extends Snake {
     this.stickyFoodTarget = null;
     this.threatAssessTimer = 0;
     this.fleeing = false;
+    this.fleeFrom = null;
+    this.lastBoostBurst = 0;
+    this.lodSkipCounter = Math.floor(Math.random() * 3);
+  }
+
+  scanThreats(allSnakes, checkX, checkY, lookAhead) {
+    const dangerMargin = this.headRadius + 60;
+    const threats = [];
+    const seenSnakes = new Set();
+
+    forEachNearbySegment(checkX, checkY, dangerMargin * 2.2, (entry) => {
+      if (entry.snake === this && entry.index < 8) return false;
+      if (!entry.snake.alive) return false;
+      const seg = entry.seg;
+      const dx = seg.x - checkX, dy = seg.y - checkY;
+      const dist2 = dx * dx + dy * dy;
+      if (dist2 < (dangerMargin * 2.2) * (dangerMargin * 2.2)) {
+        if (!seenSnakes.has(entry.snake)) {
+          seenSnakes.add(entry.snake);
+          threats.push({ snake: entry.snake, seg, dist2, isSelf: entry.snake === this });
+        } else {
+          for (let t of threats) {
+            if (t.snake === entry.snake && dist2 < t.dist2) {
+              t.seg = seg;
+              t.dist2 = dist2;
+            }
+          }
+        }
+      }
+      return false;
+    });
+
+    return threats;
   }
 
   think(allSnakes, dt) {
@@ -721,8 +767,8 @@ class AISnake extends Snake {
     const turnRadius = this.speed / TURN_RATE;
 
     let closestFood = null;
-    let closestDist = Infinity;
-    const searchRadius = 400;
+    let closestFoodScore = -Infinity;
+    const searchRadius = 420;
 
     if (this.stickyFoodTarget) {
       const f = this.stickyFoodTarget;
@@ -736,12 +782,13 @@ class AISnake extends Snake {
           this.stickyFoodTarget = null;
         } else {
           closestFood = f;
-          closestDist = d2;
         }
       }
     }
 
     if (!closestFood) {
+      let bestFood = null;
+      let bestScore = -Infinity;
       forEachNearbyFood(head.x, head.y, searchRadius, (f) => {
         const dx = f.x - head.x, dy = f.y - head.y;
         const d2 = dx * dx + dy * dy;
@@ -754,45 +801,83 @@ class AISnake extends Snake {
         const dist = Math.sqrt(d2);
 
         const reachable = dist > turnRadius * 0.6 || Math.abs(turnNeeded) < 0.5;
+        if (!reachable) return false;
 
-        if (reachable && d2 < closestDist) {
-          closestDist = d2;
-          closestFood = f;
+        const bucket = spatialFoodGrid.get(cellKey(f.x, f.y));
+        const nearbyBonus = bucket ? bucket.length : 1;
+
+        const distScore = 1 - Math.min(1, dist / searchRadius);
+        const turnScore = 1 - Math.min(1, Math.abs(turnNeeded) / Math.PI);
+        const valueScore = f.value / FOOD_MAX_VALUE;
+        const clusterScore = Math.min(1, nearbyBonus / 8);
+        const score = distScore * 0.4 + turnScore * 0.25 + valueScore * 0.15 + clusterScore * 0.2;
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestFood = f;
         }
         return false;
       });
-      if (closestFood) this.stickyFoodTarget = closestFood;
+      if (bestFood) {
+        closestFood = bestFood;
+        this.stickyFoodTarget = bestFood;
+      }
     }
 
-    let avoidAngle = null;
     const lookAhead = this.headRadius * 6 + turnRadius * 0.6 + 50;
     const checkX = head.x + Math.cos(this.angle) * lookAhead;
     const checkY = head.y + Math.sin(this.angle) * lookAhead;
     const noticesDanger = Math.random() < diff.avoidSkill;
+
+    let avoidAngle = null;
     let avoidWasOwnTail = false;
-    let dangerousSnake = null;
+    let mostUrgentThreat = null;
+    let opportunityTarget = null;
 
     if (noticesDanger) {
+      const threats = this.scanThreats(allSnakes, checkX, checkY, lookAhead);
       const dangerMargin = this.headRadius + 60;
-      forEachNearbySegment(checkX, checkY, dangerMargin, (entry) => {
-        if (entry.snake === this && entry.index < 8) return false;
-        if (!entry.snake.alive) return false;
-        const seg = entry.seg;
-        const dx = seg.x - checkX, dy = seg.y - checkY;
-        const dist2 = dx * dx + dy * dy;
-        if (dist2 < dangerMargin * dangerMargin) {
-          const escapeAngle = Math.atan2(head.y - seg.y, head.x - seg.x);
-          let turnToEscape = escapeAngle - this.angle;
-          while (turnToEscape > Math.PI) turnToEscape -= Math.PI * 2;
-          while (turnToEscape < -Math.PI) turnToEscape += Math.PI * 2;
-          const perpAngle = this.angle + (turnToEscape >= 0 ? Math.PI / 2 : -Math.PI / 2);
-          avoidAngle = perpAngle;
-          avoidWasOwnTail = (entry.snake === this);
-          dangerousSnake = entry.snake;
-          return true;
+
+      let worstUrgency = -Infinity;
+      for (let t of threats) {
+        if (t.isSelf) continue;
+        const otherHead = t.snake.segments[0];
+        const headDx = otherHead.x - head.x, headDy = otherHead.y - head.y;
+        const headDist = Math.hypot(headDx, headDy);
+        const closingAngle = Math.atan2(headDy, headDx);
+        const otherHeading = t.snake.angle;
+        let headOnFactor = Math.cos(otherHeading - (closingAngle + Math.PI));
+        const proximityUrgency = 1 - Math.min(1, Math.sqrt(t.dist2) / (dangerMargin * 2.2));
+        const headOnUrgency = Math.max(0, headOnFactor) * 0.5;
+        const sizeUrgency = t.snake.length > this.length * 1.1 ? 0.6 : 0.1;
+        const urgency = proximityUrgency + headOnUrgency + sizeUrgency;
+
+        if (Math.sqrt(t.dist2) < dangerMargin && urgency > worstUrgency) {
+          worstUrgency = urgency;
+          mostUrgentThreat = t;
         }
-        return false;
-      });
+      }
+
+      for (let t of threats) {
+        if (t.isSelf) continue;
+        if (t.snake.length < this.length * 0.7 && Math.sqrt(t.dist2) < dangerMargin * 1.8) {
+          const otherHead = t.snake.segments[0];
+          const d = Math.hypot(otherHead.x - head.x, otherHead.y - head.y);
+          if (!opportunityTarget || d < opportunityTarget.dist) {
+            opportunityTarget = { snake: t.snake, dist: d };
+          }
+        }
+      }
+
+      if (mostUrgentThreat) {
+        const seg = mostUrgentThreat.seg;
+        const escapeAngle = Math.atan2(head.y - seg.y, head.x - seg.x);
+        let turnToEscape = escapeAngle - this.angle;
+        while (turnToEscape > Math.PI) turnToEscape -= Math.PI * 2;
+        while (turnToEscape < -Math.PI) turnToEscape += Math.PI * 2;
+        avoidAngle = this.angle + (turnToEscape >= 0 ? Math.PI / 2 : -Math.PI / 2);
+        avoidWasOwnTail = mostUrgentThreat.isSelf;
+      }
     }
 
     const margin = 300;
@@ -804,17 +889,28 @@ class AISnake extends Snake {
 
     this.threatAssessTimer -= dtSeconds;
     if (this.threatAssessTimer <= 0) {
-      this.threatAssessTimer = 0.3;
+      this.threatAssessTimer = 0.25;
       this.fleeing = false;
-      if (dangerousSnake && !avoidWasOwnTail) {
-        if (dangerousSnake.length > this.length * 1.15) {
+      this.fleeFrom = null;
+      if (mostUrgentThreat && !avoidWasOwnTail) {
+        if (mostUrgentThreat.snake.length > this.length * 1.15) {
           this.fleeing = true;
+          this.fleeFrom = mostUrgentThreat.snake;
         }
       }
     }
 
     let huntAngle = null;
-    if (player && player.alive && !avoidWasOwnTail) {
+    let huntingOpportunity = false;
+    if (opportunityTarget && !this.fleeing) {
+      huntAngle = Math.atan2(
+        opportunityTarget.snake.segments[0].y - head.y,
+        opportunityTarget.snake.segments[0].x - head.x
+      );
+      this.huntTargetIsPlayer = opportunityTarget.snake.isPlayer;
+      huntingOpportunity = true;
+      this.state = "hunt";
+    } else if (player && player.alive && !avoidWasOwnTail) {
       const dxp = player.segments[0].x - head.x;
       const dyp = player.segments[0].y - head.y;
       const distp2 = dxp * dxp + dyp * dyp;
@@ -857,7 +953,7 @@ class AISnake extends Snake {
       this.state = "edge";
     } else if (huntAngle !== null) {
       desiredAngle = huntAngle;
-      this.state = "hunt";
+      if (!huntingOpportunity) this.state = "hunt";
     } else if (closestFood) {
       desiredAngle = Math.atan2(closestFood.y - head.y, closestFood.x - head.x);
       this.state = "seek";
@@ -880,14 +976,19 @@ class AISnake extends Snake {
 
     this.targetAngle = desiredAngle;
 
+    this.lastBoostBurst -= dtSeconds;
     const frameNormalizer = dtSeconds * 60;
     if (this.segments.length > 60) {
-      if (this.fleeing && avoidAngle !== null) {
-        this.boosting = Math.random() < diff.boostChanceFlee * frameNormalizer;
-      } else if (this.state === "hunt") {
+      if (this.fleeing && avoidAngle !== null && this.lastBoostBurst <= 0) {
+        this.boosting = Math.random() < diff.boostChanceFlee * frameNormalizer * 2;
+        if (this.boosting) this.lastBoostBurst = 0.4;
+      } else if (huntingOpportunity && opportunityTarget && opportunityTarget.dist < turnRadius * 1.5) {
+        this.boosting = Math.random() < diff.boostChanceHunt * frameNormalizer * 1.8;
+      } else if (this.state === "hunt" && !huntingOpportunity) {
         this.boosting = Math.random() < diff.boostChanceHunt * frameNormalizer;
-      } else if (this.state === "seek" && closestDist < (turnRadius * 2) * (turnRadius * 2)) {
-        this.boosting = Math.random() < diff.boostChanceSeek * frameNormalizer;
+      } else if (this.state === "seek" && closestFood) {
+        const fd = Math.hypot(closestFood.x - head.x, closestFood.y - head.y);
+        this.boosting = fd < turnRadius * 1.2 && Math.random() < diff.boostChanceSeek * frameNormalizer;
       } else {
         this.boosting = false;
       }
@@ -971,6 +1072,15 @@ function forEachNearbyFood(x, y, radius, callback) {
 function killSnake(snake, killer) {
   snake.alive = false;
 
+  const segs = snake.segments;
+  const totalValue = Math.max(1, snake.length);
+  const dropSpacing = 3;
+  const dropCount = Math.max(1, Math.floor(segs.length / dropSpacing));
+  const valuePerDrop = Math.min(FOOD_MAX_VALUE, Math.max(FOOD_MIN_VALUE, Math.round(totalValue / dropCount / 2)));
+  for (let i = 0; i < segs.length; i += dropSpacing) {
+    spawnFood(segs[i].x, segs[i].y, valuePerDrop, snake.color1);
+  }
+
   if (killer && killer.alive && killer !== snake) {
     killer.registerKill();
   }
@@ -1007,11 +1117,7 @@ function checkCollisions() {
 
     const distFromCenter = Math.hypot(head.x, head.y);
     if (distFromCenter + headR >= worldRadius) {
-      const isCentralPlayer = snake.isPlayer;
       killSnake(snake, null);
-      if (isCentralPlayer) {
-        foods.length = 0;
-      }
       continue;
     }
 
@@ -1052,11 +1158,8 @@ function checkCollisions() {
       return false;
     });
     if (killerHit) {
-      const isCentralPlayer = snake.isPlayer;
       killSnake(snake, killerHit);
-      if (isCentralPlayer) {
-        foods.length = 0;
-      } else if (killerHit.isPlayer) {
+      if (killerHit.isPlayer) {
         syncLiveStats(playerName, killerHit.length, killerHit.boops);
       }
     }
@@ -1615,10 +1718,26 @@ function gameStep(dt) {
   const allSnakesForPerception = [player, ...aiSnakes].filter(s => s && s.alive);
   rebuildSpatialGrids(allSnakesForPerception);
 
+  const px = player ? player.segments[0].x : 0;
+  const py = player ? player.segments[0].y : 0;
+  const lodRadius = Math.max(W, H) / Math.max(0.2, camera.zoom) * 1.6;
+  const lodRadiusSq = lodRadius * lodRadius;
+
   for (let ai of aiSnakes) {
     if (!ai.alive) continue;
-    ai.think(allSnakesForPerception, dt);
-    ai.move(dt);
+    const head = ai.segments[0];
+    const dx = head.x - px, dy = head.y - py;
+    const farAway = (dx * dx + dy * dy) > lodRadiusSq;
+
+    if (farAway) {
+      ai.lodSkipCounter = (ai.lodSkipCounter + 1) % 3;
+      if (ai.lodSkipCounter !== 0) continue;
+      ai.think(allSnakesForPerception, dt);
+      ai.move(dt * 3);
+    } else {
+      ai.think(allSnakesForPerception, dt);
+      ai.move(dt);
+    }
   }
 
   updateWorldRadius();
