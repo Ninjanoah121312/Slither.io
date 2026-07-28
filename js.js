@@ -38,29 +38,190 @@ function getSupabaseClient() {
   return null;
 }
 
-async function saveScore(name, length, boops) {
+function encodeUuidLocal(uuidNumber) {
+  try {
+    return btoa(String(uuidNumber));
+  } catch (e) {
+    return String(uuidNumber);
+  }
+}
+
+function decodeUuidLocal(encoded) {
+  try {
+    return atob(encoded);
+  } catch (e) {
+    return encoded;
+  }
+}
+
+function getLocalUuid() {
+  try {
+    const stored = window.localStorage ? window.localStorage.getItem("slither_uuid_b64") : null;
+    if (stored) {
+      const decoded = decodeUuidLocal(stored);
+      const num = parseInt(decoded, 10);
+      if (!isNaN(num)) return num;
+    }
+  } catch (e) {}
+  return null;
+}
+
+function setLocalUuid(uuidNumber) {
+  try {
+    if (window.localStorage) {
+      window.localStorage.setItem("slither_uuid_b64", encodeUuidLocal(uuidNumber));
+    }
+  } catch (e) {}
+}
+
+function generateCandidateUuid() {
+  let s = "";
+  s += (1 + Math.floor(Math.random() * 9));
+  for (let i = 0; i < 49; i++) {
+    s += Math.floor(Math.random() * 10);
+  }
+  return parseInt(s.slice(0, 15), 10);
+}
+
+async function ensureUniqueUuid() {
+  const client = getSupabaseClient();
+  let existing = getLocalUuid();
+  if (existing !== null) return existing;
+
+  if (!client) {
+    const fallback = generateCandidateUuid();
+    setLocalUuid(fallback);
+    return fallback;
+  }
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const candidate = generateCandidateUuid();
+    try {
+      const { data, error } = await client.from("data").select("uuid").eq("uuid", candidate).limit(1);
+      if (error) {
+        console.error("UUID uniqueness check failed:", error.message || error);
+        setLocalUuid(candidate);
+        return candidate;
+      }
+      if (!data || data.length === 0) {
+        setLocalUuid(candidate);
+        return candidate;
+      }
+    } catch (err) {
+      console.error("UUID uniqueness check exception:", err);
+      setLocalUuid(candidate);
+      return candidate;
+    }
+  }
+  const fallback = generateCandidateUuid();
+  setLocalUuid(fallback);
+  return fallback;
+}
+
+async function upsertPlayerRow(fields) {
   const client = getSupabaseClient();
   if (!client) {
-    console.warn("Supabase unavailable; score was not saved online.");
+    console.warn("Supabase unavailable; data was not saved online.");
     return false;
   }
+  const uuid = await ensureUniqueUuid();
   try {
-    const { error } = await client
-      .from("Data")
-      .insert([{
-        name: name,
-        score: Math.round(length),
-        boops: Math.round(boops),
-        score_time: new Date().toISOString()
-      }]);
-    if (error) {
-      console.error("Supabase insert failed:", error.message || error);
-      return false;
+    const { data: existingRows, error: selectError } = await client
+      .from("data")
+      .select("uuid")
+      .eq("uuid", uuid)
+      .limit(1);
+    if (selectError) {
+      console.error("Supabase select-before-upsert failed:", selectError.message || selectError);
+    }
+
+    const rowExists = existingRows && existingRows.length > 0;
+    const payload = Object.assign({ uuid: uuid }, fields);
+
+    if (rowExists) {
+      const { error } = await client.from("data").update(fields).eq("uuid", uuid);
+      if (error) {
+        console.error("Supabase update failed:", error.message || error);
+        return false;
+      }
+    } else {
+      const { error } = await client.from("data").insert([payload]);
+      if (error) {
+        console.error("Supabase insert failed:", error.message || error);
+        return false;
+      }
     }
     return true;
   } catch (err) {
-    console.error("Supabase insert exception:", err);
+    console.error("Supabase upsert exception:", err);
     return false;
+  }
+}
+
+async function syncLiveStats(name, latestScore, latestBoops) {
+  const fields = {
+    name: name,
+    latest_score: Math.round(latestScore),
+    latest_boops: Math.round(latestBoops),
+    latest_score_time: new Date().toISOString(),
+    latest_game_mode: "pva",
+    current_game_mode: "pva"
+  };
+
+  const cachedBest = getCachedBest();
+  if (!cachedBest || latestScore > cachedBest.best_score) {
+    fields.best_score = Math.round(latestScore);
+    fields.best_boops = Math.round(latestBoops);
+    fields.best_score_time = new Date().toISOString();
+    fields.best_game_mode = "pva";
+    setCachedBest({ best_score: Math.round(latestScore), best_boops: Math.round(latestBoops), best_score_time: fields.best_score_time });
+  }
+
+  return upsertPlayerRow(fields);
+}
+
+let cachedBestStats = null;
+function getCachedBest() {
+  if (cachedBestStats) return cachedBestStats;
+  try {
+    const raw = window.localStorage ? window.localStorage.getItem("slither_best_cache") : null;
+    if (raw) {
+      cachedBestStats = JSON.parse(raw);
+      return cachedBestStats;
+    }
+  } catch (e) {}
+  return null;
+}
+function setCachedBest(obj) {
+  cachedBestStats = obj;
+  try {
+    if (window.localStorage) window.localStorage.setItem("slither_best_cache", JSON.stringify(obj));
+  } catch (e) {}
+}
+
+async function incrementGamesCount() {
+  const client = getSupabaseClient();
+  if (!client) return;
+  const uuid = await ensureUniqueUuid();
+  try {
+    const { data: existingRows, error: selectError } = await client
+      .from("data")
+      .select("ai_games_count")
+      .eq("uuid", uuid)
+      .limit(1);
+    if (selectError) {
+      console.error("Supabase select-before-increment failed:", selectError.message || selectError);
+    }
+    const rowExists = existingRows && existingRows.length > 0;
+    const currentCount = rowExists && existingRows[0].ai_games_count ? existingRows[0].ai_games_count : 0;
+    const fields = { ai_games_count: currentCount + 1, current_game_mode: "pva" };
+    if (rowExists) {
+      await client.from("data").update(fields).eq("uuid", uuid);
+    } else {
+      await client.from("data").insert([Object.assign({ uuid: uuid, name: playerName || "" }, fields)]);
+    }
+  } catch (err) {
+    console.error("Supabase increment games count exception:", err);
   }
 }
 
@@ -69,9 +230,9 @@ async function fetchLeaderboard() {
   if (!client) return [];
   try {
     const { data, error } = await client
-      .from("Data")
-      .select("name,score,boops,score_time")
-      .order("score", { ascending: false })
+      .from("data")
+      .select("name,latest_score,latest_boops,latest_score_time")
+      .order("latest_score", { ascending: false })
       .limit(10);
     if (error) {
       console.error("Supabase select failed:", error.message || error);
@@ -84,17 +245,39 @@ async function fetchLeaderboard() {
   }
 }
 
-const WORLD_SIZE = 6000;
-const WORLD_RADIUS_MAX = 3000;
-const WORLD_RADIUS_MIN = 1400;
+async function fetchBestLeaderboard() {
+  const client = getSupabaseClient();
+  if (!client) return [];
+  try {
+    const { data, error } = await client
+      .from("data")
+      .select("name,best_score,best_boops,best_score_time")
+      .order("best_score", { ascending: false })
+      .limit(10);
+    if (error) {
+      console.error("Supabase best-select failed:", error.message || error);
+      return [];
+    }
+    return data || [];
+  } catch (err) {
+    console.error("Supabase best-select exception:", err);
+    return [];
+  }
+}
+
+const WORLD_SIZE = 120000;
+const WORLD_RADIUS_MAX = 60000;
+const WORLD_RADIUS_MIN = 20000;
 
 const FOOD_MIN_RADIUS = 4;
 const FOOD_MAX_RADIUS = 10;
 const FOOD_MIN_VALUE = 1;
 const FOOD_MAX_VALUE = 10;
 const FOOD_DENSITY_PER_AREA = 0.00009;
+const FOOD_WOBBLE_RADIUS = 8;
+const FOOD_WOBBLE_SPEED = 0.6;
 
-const AI_COUNT_BASE = 12;
+const AI_COUNT_BASE = 499;
 
 const BASE_SPEED = 156;
 const BOOST_SPEED = 288;
@@ -102,16 +285,17 @@ const TURN_RATE = 5.4;
 const BASE_SEGMENT_SPACING = 6.5;
 const BASE_HEAD_RADIUS = 10;
 
-const START_LENGTH = 12;
+const START_LENGTH = 20;
 const SCORE_PER_KILL = 50;
 const BOOPS_PER_KILL = 1;
 
 const GROWTH_SLOWDOWN_START = 150;
-const GROWTH_SLOWDOWN_MIN_MULT = 0.25;
+const GROWTH_SLOWDOWN_MIN_MULT = 0.12;
+const GROWTH_RATE_MULT = 0.35;
 
-const MAX_THICKNESS_LENGTH = 900;
+const MAX_THICKNESS_LENGTH = 6000;
 const MIN_RADIUS_MULT = 1.0;
-const MAX_RADIUS_MULT = 2.6;
+const MAX_RADIUS_MULT = 5.2;
 
 const MIN_BOOST_LENGTH = 10;
 const BOOST_TICK_INTERVAL = 100;
@@ -119,12 +303,13 @@ const BOOST_LENGTH_PER_TICK = 1;
 const BOOST_FOOD_DROP_INTERVAL = 100;
 
 const SHRINK_ANIM_SPEED = 8;
+const GROW_ANIM_SPEED = 10;
 
 const CAMERA_LERP = 0.08;
-const ZOOM_MIN = 0.55;
-const ZOOM_MAX = 1.15;
 
 const COLLISION_CHECK_STEP = 1;
+
+const FOOD_MAGNET_MULT = 0.5;
 
 const SNAKE_COLORS = [
   ["#4fd6ff", "#1a9fd6"],
@@ -151,31 +336,31 @@ function makeAIName() {
 
 const DIFFICULTY_PRESETS = {
   easy: {
-    aiCount: 9,
     huntChance: 0.05,
     huntRange: 260,
     boostChanceSeek: 0.006,
-    boostChanceHunt: 0.01,
+    boostChanceHunt: 0.008,
+    boostChanceFlee: 0.02,
     reactionSlack: 0.35,
     aggressionSpeedMult: 0.95,
     avoidSkill: 0.7
   },
   medium: {
-    aiCount: 12,
-    huntChance: 0.12,
+    huntChance: 0.1,
     huntRange: 380,
-    boostChanceSeek: 0.01,
-    boostChanceHunt: 0.02,
+    boostChanceSeek: 0.008,
+    boostChanceHunt: 0.014,
+    boostChanceFlee: 0.03,
     reactionSlack: 0.15,
     aggressionSpeedMult: 1.0,
     avoidSkill: 0.85
   },
   hard: {
-    aiCount: 16,
-    huntChance: 0.28,
+    huntChance: 0.2,
     huntRange: 560,
-    boostChanceSeek: 0.016,
-    boostChanceHunt: 0.045,
+    boostChanceSeek: 0.012,
+    boostChanceHunt: 0.022,
+    boostChanceFlee: 0.045,
     reactionSlack: 0.0,
     aggressionSpeedMult: 1.08,
     avoidSkill: 1.0
@@ -199,7 +384,7 @@ let player = null;
 let aiSnakes = [];
 let foods = [];
 
-let camera = { x: 0, y: 0, zoom: 1, targetZoom: 1 };
+let camera = { x: 0, y: 0, zoom: 1 };
 
 let lastTime = 0;
 let fps = 0;
@@ -208,13 +393,9 @@ let fpsFrames = 0;
 
 let worldRadius = WORLD_RADIUS_MAX;
 
-function getWorldRadius() {
-  return worldRadius;
-}
-
 function updateWorldRadius() {
   const totalSnakes = 1 + aiSnakes.length;
-  const t = Math.min(1, totalSnakes / 30);
+  const t = Math.min(1, totalSnakes / 500);
   worldRadius = WORLD_RADIUS_MAX - t * (WORLD_RADIUS_MAX - WORLD_RADIUS_MIN);
 }
 
@@ -235,9 +416,7 @@ function setupInput() {
     input.mouseY = e.clientY;
   });
 
-  window.addEventListener("mousedown", (e) => {
-    input.boosting = true;
-  });
+  window.addEventListener("mousedown", () => { input.boosting = true; });
   window.addEventListener("mouseup", () => { input.boosting = false; });
   window.addEventListener("contextmenu", (e) => {
     if (gameRunning) e.preventDefault();
@@ -260,16 +439,19 @@ function setupInput() {
   });
 }
 
+function zoomForLength(length) {
+  const t = Math.min(1, Math.max(0, (length - START_LENGTH) / 2000));
+  return 1.15 - t * 0.75;
+}
+
 function updateCamera(target) {
   if (!target) return;
   const desiredX = target.segments[0].x;
   const desiredY = target.segments[0].y;
   camera.x += (desiredX - camera.x) * CAMERA_LERP;
   camera.y += (desiredY - camera.y) * CAMERA_LERP;
-
-  const lengthRatio = Math.min(1, target.segments.length / 400);
-  camera.targetZoom = ZOOM_MAX - lengthRatio * (ZOOM_MAX - ZOOM_MIN);
-  camera.zoom += (camera.targetZoom - camera.zoom) * 0.05;
+  const targetZoom = zoomForLength(target.length);
+  camera.zoom += (targetZoom - camera.zoom) * 0.05;
 }
 
 function worldToScreen(x, y) {
@@ -292,11 +474,15 @@ function radiusForFoodValue(value) {
 function spawnFood(x, y, value, color) {
   const clampedValue = Math.max(FOOD_MIN_VALUE, Math.min(FOOD_MAX_VALUE, value || 1));
   foods.push({
+    baseX: x,
+    baseY: y,
     x, y,
     radius: radiusForFoodValue(clampedValue),
     color: color || randomFoodColor(),
     value: clampedValue,
-    pulse: Math.random() * Math.PI * 2
+    pulse: Math.random() * Math.PI * 2,
+    wobblePhase: Math.random() * Math.PI * 2,
+    wobbleSpeed: FOOD_WOBBLE_SPEED * (0.7 + Math.random() * 0.6)
   });
 }
 
@@ -317,26 +503,23 @@ function fillFoodToTarget() {
     const p = randomPointInWorld(30);
     spawnFood(p.x, p.y, value);
   }
-  const target2 = target;
-  if (foods.length > target2 + 200) {
-    foods.length = target2;
+  if (foods.length > target + 200) {
+    foods.length = target;
   }
 }
 
-function dropFoodAlongPath(snake) {
-  const segs = snake.segments;
-  const step = Math.max(1, Math.floor(segs.length / 60));
-  const totalValue = Math.max(1, Math.round(snake.length));
-  const dropCount = Math.max(1, Math.floor(segs.length / step));
-  const valuePerDrop = Math.min(FOOD_MAX_VALUE, Math.max(FOOD_MIN_VALUE, Math.round(totalValue / dropCount)));
-
-  for (let i = 0; i < segs.length; i += step) {
-    spawnFood(
-      segs[i].x + (Math.random() - 0.5) * 10,
-      segs[i].y + (Math.random() - 0.5) * 10,
-      valuePerDrop,
-      snake.color1
-    );
+function updateFoodWobble(dt) {
+  const dtSeconds = Math.min(dt, 100) / 1000;
+  for (let i = foods.length - 1; i >= 0; i--) {
+    const f = foods[i];
+    const distFromCenter = Math.hypot(f.baseX, f.baseY);
+    if (distFromCenter > worldRadius) {
+      foods.splice(i, 1);
+      continue;
+    }
+    f.wobblePhase += f.wobbleSpeed * dtSeconds;
+    f.x = f.baseX + Math.cos(f.wobblePhase) * FOOD_WOBBLE_RADIUS;
+    f.y = f.baseY + Math.sin(f.wobblePhase * 1.3) * FOOD_WOBBLE_RADIUS;
   }
 }
 
@@ -447,7 +630,8 @@ class Snake {
       this.displaySegmentCount -= SHRINK_ANIM_SPEED * dtSeconds;
       if (this.displaySegmentCount < this.segmentCount) this.displaySegmentCount = this.segmentCount;
     } else if (this.displaySegmentCount < this.segmentCount) {
-      this.displaySegmentCount = this.segmentCount;
+      this.displaySegmentCount += GROW_ANIM_SPEED * dtSeconds;
+      if (this.displaySegmentCount > this.segmentCount) this.displaySegmentCount = this.segmentCount;
     }
 
     this.eyeBlink += dtSeconds * 5;
@@ -500,8 +684,7 @@ class Snake {
   }
 
   eat(foodValue) {
-    this.boops += 1;
-    this.grow(foodValue);
+    this.grow(foodValue * GROWTH_RATE_MULT);
   }
 
   registerKill() {
@@ -526,63 +709,119 @@ class AISnake extends Snake {
     this.state = "wander";
     this.huntCommit = 0;
     this.huntTargetIsPlayer = false;
+    this.stickyFoodTarget = null;
+    this.threatAssessTimer = 0;
+    this.fleeing = false;
   }
 
   think(allSnakes, dt) {
     const dtSeconds = Math.min(dt, 100) / 1000;
     const diff = getDifficulty();
     const head = this.segments[0];
+    const turnRadius = this.speed / TURN_RATE;
 
     let closestFood = null;
     let closestDist = Infinity;
     const searchRadius = 400;
-    for (let i = 0; i < foods.length; i++) {
-      const f = foods[i];
-      const dx = f.x - head.x, dy = f.y - head.y;
-      const d2 = dx * dx + dy * dy;
-      if (d2 < searchRadius * searchRadius && d2 < closestDist) {
-        closestDist = d2;
-        closestFood = f;
+
+    if (this.stickyFoodTarget) {
+      const f = this.stickyFoodTarget;
+      const stillExists = foods.indexOf(f) !== -1;
+      if (!stillExists) {
+        this.stickyFoodTarget = null;
+      } else {
+        const dx = f.x - head.x, dy = f.y - head.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > (searchRadius * 1.4) * (searchRadius * 1.4)) {
+          this.stickyFoodTarget = null;
+        } else {
+          closestFood = f;
+          closestDist = d2;
+        }
       }
     }
 
+    if (!closestFood) {
+      forEachNearbyFood(head.x, head.y, searchRadius, (f) => {
+        const dx = f.x - head.x, dy = f.y - head.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 >= searchRadius * searchRadius) return false;
+
+        const angleToFood = Math.atan2(dy, dx);
+        let turnNeeded = angleToFood - this.angle;
+        while (turnNeeded > Math.PI) turnNeeded -= Math.PI * 2;
+        while (turnNeeded < -Math.PI) turnNeeded += Math.PI * 2;
+        const dist = Math.sqrt(d2);
+
+        const reachable = dist > turnRadius * 0.6 || Math.abs(turnNeeded) < 0.5;
+
+        if (reachable && d2 < closestDist) {
+          closestDist = d2;
+          closestFood = f;
+        }
+        return false;
+      });
+      if (closestFood) this.stickyFoodTarget = closestFood;
+    }
+
     let avoidAngle = null;
-    const lookAhead = this.headRadius * 6 + 60;
+    const lookAhead = this.headRadius * 6 + turnRadius * 0.6 + 50;
     const checkX = head.x + Math.cos(this.angle) * lookAhead;
     const checkY = head.y + Math.sin(this.angle) * lookAhead;
     const noticesDanger = Math.random() < diff.avoidSkill;
+    let avoidWasOwnTail = false;
+    let dangerousSnake = null;
 
     if (noticesDanger) {
-      for (let s of allSnakes) {
-        if (s === this || !s.alive) continue;
-        const segs = s.segments;
-        for (let i = 0; i < segs.length; i += COLLISION_CHECK_STEP) {
-          const seg = segs[i];
-          const dx = seg.x - checkX, dy = seg.y - checkY;
-          const dist2 = dx * dx + dy * dy;
-          if (dist2 < 70 * 70) {
-            avoidAngle = Math.atan2(head.y - seg.y, head.x - seg.x);
-            break;
-          }
+      const dangerMargin = this.headRadius + 60;
+      forEachNearbySegment(checkX, checkY, dangerMargin, (entry) => {
+        if (entry.snake === this && entry.index < 8) return false;
+        if (!entry.snake.alive) return false;
+        const seg = entry.seg;
+        const dx = seg.x - checkX, dy = seg.y - checkY;
+        const dist2 = dx * dx + dy * dy;
+        if (dist2 < dangerMargin * dangerMargin) {
+          const escapeAngle = Math.atan2(head.y - seg.y, head.x - seg.x);
+          let turnToEscape = escapeAngle - this.angle;
+          while (turnToEscape > Math.PI) turnToEscape -= Math.PI * 2;
+          while (turnToEscape < -Math.PI) turnToEscape += Math.PI * 2;
+          const perpAngle = this.angle + (turnToEscape >= 0 ? Math.PI / 2 : -Math.PI / 2);
+          avoidAngle = perpAngle;
+          avoidWasOwnTail = (entry.snake === this);
+          dangerousSnake = entry.snake;
+          return true;
         }
-        if (avoidAngle !== null) break;
-      }
+        return false;
+      });
     }
 
     const margin = 300;
     let edgeAngle = null;
     const distFromCenter = Math.hypot(head.x, head.y);
-    if (distFromCenter > worldRadius - margin) {
+    if (distFromCenter > worldRadius - margin - turnRadius) {
       edgeAngle = Math.atan2(-head.y, -head.x);
     }
 
+    this.threatAssessTimer -= dtSeconds;
+    if (this.threatAssessTimer <= 0) {
+      this.threatAssessTimer = 0.3;
+      this.fleeing = false;
+      if (dangerousSnake && !avoidWasOwnTail) {
+        if (dangerousSnake.length > this.length * 1.15) {
+          this.fleeing = true;
+        }
+      }
+    }
+
     let huntAngle = null;
-    if (player && player.alive) {
+    if (player && player.alive && !avoidWasOwnTail) {
       const dxp = player.segments[0].x - head.x;
       const dyp = player.segments[0].y - head.y;
       const distp2 = dxp * dxp + dyp * dyp;
       const inRange = distp2 < diff.huntRange * diff.huntRange;
-      const sizeOk = this.segments.length + 20 > player.segments.length * 0.5 || currentDifficulty === "hard";
+      const muchBigger = this.length > player.length * 1.3;
+      const muchSmaller = player.length > this.length * 1.3;
+      const sizeOk = muchBigger && !muchSmaller;
 
       if (this.huntCommit > 0) {
         this.huntCommit -= dtSeconds;
@@ -590,7 +829,7 @@ class AISnake extends Snake {
         this.huntCommit = 1.5 + Math.random() * 2;
       }
 
-      if (this.huntCommit > 0 && inRange) {
+      if (this.huntCommit > 0 && inRange && sizeOk) {
         let aimX = player.segments[0].x;
         let aimY = player.segments[0].y;
         if (currentDifficulty === "hard") {
@@ -601,6 +840,7 @@ class AISnake extends Snake {
         this.huntTargetIsPlayer = true;
       } else {
         this.huntTargetIsPlayer = false;
+        this.huntCommit = 0;
       }
     } else {
       this.huntTargetIsPlayer = false;
@@ -611,6 +851,7 @@ class AISnake extends Snake {
     if (avoidAngle !== null) {
       desiredAngle = avoidAngle;
       this.state = "avoid";
+      this.stickyFoodTarget = null;
     } else if (edgeAngle !== null) {
       desiredAngle = edgeAngle;
       this.state = "edge";
@@ -641,9 +882,11 @@ class AISnake extends Snake {
 
     const frameNormalizer = dtSeconds * 60;
     if (this.segments.length > 60) {
-      if (this.state === "hunt") {
+      if (this.fleeing && avoidAngle !== null) {
+        this.boosting = Math.random() < diff.boostChanceFlee * frameNormalizer;
+      } else if (this.state === "hunt") {
         this.boosting = Math.random() < diff.boostChanceHunt * frameNormalizer;
-      } else if (this.state === "seek") {
+      } else if (this.state === "seek" && closestDist < (turnRadius * 2) * (turnRadius * 2)) {
         this.boosting = Math.random() < diff.boostChanceSeek * frameNormalizer;
       } else {
         this.boosting = false;
@@ -659,9 +902,74 @@ function distSq(ax, ay, bx, by) {
   return dx * dx + dy * dy;
 }
 
+const SPATIAL_CELL_SIZE = 120;
+let spatialSegmentGrid = new Map();
+let spatialFoodGrid = new Map();
+
+function cellKey(x, y) {
+  const cx = Math.floor(x / SPATIAL_CELL_SIZE);
+  const cy = Math.floor(y / SPATIAL_CELL_SIZE);
+  return cx + "," + cy;
+}
+
+function rebuildSpatialGrids(allSnakes) {
+  spatialSegmentGrid = new Map();
+  spatialFoodGrid = new Map();
+
+  for (let snake of allSnakes) {
+    const segs = snake.segments;
+    for (let i = 0; i < segs.length; i += COLLISION_CHECK_STEP) {
+      const key = cellKey(segs[i].x, segs[i].y);
+      let bucket = spatialSegmentGrid.get(key);
+      if (!bucket) { bucket = []; spatialSegmentGrid.set(key, bucket); }
+      bucket.push({ snake, seg: segs[i], index: i });
+    }
+  }
+
+  for (let f of foods) {
+    const key = cellKey(f.x, f.y);
+    let bucket = spatialFoodGrid.get(key);
+    if (!bucket) { bucket = []; spatialFoodGrid.set(key, bucket); }
+    bucket.push(f);
+  }
+}
+
+function forEachNearbySegment(x, y, radius, callback) {
+  const minCx = Math.floor((x - radius) / SPATIAL_CELL_SIZE);
+  const maxCx = Math.floor((x + radius) / SPATIAL_CELL_SIZE);
+  const minCy = Math.floor((y - radius) / SPATIAL_CELL_SIZE);
+  const maxCy = Math.floor((y + radius) / SPATIAL_CELL_SIZE);
+
+  for (let cx = minCx; cx <= maxCx; cx++) {
+    for (let cy = minCy; cy <= maxCy; cy++) {
+      const bucket = spatialSegmentGrid.get(cx + "," + cy);
+      if (!bucket) continue;
+      for (let entry of bucket) {
+        if (callback(entry) === true) return;
+      }
+    }
+  }
+}
+
+function forEachNearbyFood(x, y, radius, callback) {
+  const minCx = Math.floor((x - radius) / SPATIAL_CELL_SIZE);
+  const maxCx = Math.floor((x + radius) / SPATIAL_CELL_SIZE);
+  const minCy = Math.floor((y - radius) / SPATIAL_CELL_SIZE);
+  const maxCy = Math.floor((y + radius) / SPATIAL_CELL_SIZE);
+
+  for (let cx = minCx; cx <= maxCx; cx++) {
+    for (let cy = minCy; cy <= maxCy; cy++) {
+      const bucket = spatialFoodGrid.get(cx + "," + cy);
+      if (!bucket) continue;
+      for (let f of bucket) {
+        if (callback(f) === true) return;
+      }
+    }
+  }
+}
+
 function killSnake(snake, killer) {
   snake.alive = false;
-  dropFoodAlongPath(snake);
 
   if (killer && killer.alive && killer !== snake) {
     killer.registerKill();
@@ -672,8 +980,25 @@ function killSnake(snake, killer) {
   }
 }
 
+function applyFoodMagnet(snake) {
+  const head = snake.segments[0];
+  const magnetRadius = snake.headRadius * FOOD_MAGNET_MULT;
+  if (magnetRadius <= 0) return;
+  forEachNearbyFood(head.x, head.y, magnetRadius + FOOD_MAX_RADIUS, (f) => {
+    const dx = head.x - f.baseX, dy = head.y - f.baseY;
+    const dist = Math.hypot(dx, dy);
+    if (dist < magnetRadius && dist > 0.01) {
+      const pull = Math.min(1, (magnetRadius - dist) / magnetRadius) * 6;
+      f.baseX += (dx / dist) * pull;
+      f.baseY += (dy / dist) * pull;
+    }
+    return false;
+  });
+}
+
 function checkCollisions() {
   const allSnakes = [player, ...aiSnakes].filter(s => s && s.alive);
+  rebuildSpatialGrids(allSnakes);
 
   for (let snake of allSnakes) {
     if (!snake.alive) continue;
@@ -682,40 +1007,66 @@ function checkCollisions() {
 
     const distFromCenter = Math.hypot(head.x, head.y);
     if (distFromCenter + headR >= worldRadius) {
+      const isCentralPlayer = snake.isPlayer;
       killSnake(snake, null);
+      if (isCentralPlayer) {
+        foods.length = 0;
+      }
       continue;
     }
 
-    for (let i = foods.length - 1; i >= 0; i--) {
-      const f = foods[i];
+    applyFoodMagnet(snake);
+
+    const foodSearchR = headR + FOOD_MAX_RADIUS + 5;
+    const eatenFoods = [];
+    forEachNearbyFood(head.x, head.y, foodSearchR, (f) => {
       const rr = (headR + f.radius);
       if (distSq(head.x, head.y, f.x, f.y) < rr * rr) {
+        eatenFoods.push(f);
+      }
+      return false;
+    });
+    if (eatenFoods.length > 0) {
+      for (let f of eatenFoods) {
         snake.eat(f.value);
-        foods.splice(i, 1);
+        const idx = foods.indexOf(f);
+        if (idx !== -1) foods.splice(idx, 1);
+      }
+      if (snake.isPlayer) {
+        syncLiveStats(playerName, snake.length, snake.boops);
       }
     }
 
-    for (let other of allSnakes) {
-      if (!other.alive || other === snake) continue;
-      const segs = other.segments;
-      const otherR = other.headRadius;
-
-      for (let i = 1; i < segs.length; i += COLLISION_CHECK_STEP) {
-        const seg = segs[i];
-        const rr = (headR * 0.8 + otherR * 0.8);
-        if (distSq(head.x, head.y, seg.x, seg.y) < rr * rr) {
-          killSnake(snake, other);
-          break;
-        }
+    const collisionSearchR = headR * 0.8 + MAX_RADIUS_MULT * BASE_HEAD_RADIUS * 0.8 + 5;
+    let killerHit = null;
+    forEachNearbySegment(head.x, head.y, collisionSearchR, (entry) => {
+      if (entry.snake === snake) return false;
+      if (!entry.snake.alive) return false;
+      if (entry.index === 0) return false;
+      const otherR = entry.snake.headRadius;
+      const rr = (headR * 0.8 + otherR * 0.8);
+      if (distSq(head.x, head.y, entry.seg.x, entry.seg.y) < rr * rr) {
+        killerHit = entry.snake;
+        return true;
       }
-      if (!snake.alive) break;
+      return false;
+    });
+    if (killerHit) {
+      const isCentralPlayer = snake.isPlayer;
+      killSnake(snake, killerHit);
+      if (isCentralPlayer) {
+        foods.length = 0;
+      } else if (killerHit.isPlayer) {
+        syncLiveStats(playerName, killerHit.length, killerHit.boops);
+      }
     }
   }
 
   aiSnakes = aiSnakes.filter(s => s.alive);
 
-  const targetAICount = getDifficulty().aiCount;
-  while (aiSnakes.length < targetAICount) {
+  const missing = AI_COUNT_BASE - aiSnakes.length;
+  const spawnBatch = Math.min(missing, 5);
+  for (let i = 0; i < spawnBatch; i++) {
     spawnOneAI();
   }
 
@@ -735,13 +1086,10 @@ function spawnOneAI() {
 
 function initAISnakes() {
   aiSnakes = [];
-  const count = getDifficulty().aiCount;
-  for (let i = 0; i < count; i++) spawnOneAI();
+  for (let i = 0; i < AI_COUNT_BASE; i++) spawnOneAI();
 }
 
-let leaderboardCache = [];
-
-function renderLeaderboardList(listEl, data, highlightName) {
+function renderLeaderboardList(listEl, data, nameField, scoreField, highlightName) {
   listEl.innerHTML = "";
   if (!data || data.length === 0) {
     const li = document.createElement("li");
@@ -752,16 +1100,16 @@ function renderLeaderboardList(listEl, data, highlightName) {
   }
   data.forEach((row, idx) => {
     const li = document.createElement("li");
-    if (highlightName && row.name === highlightName) li.classList.add("me");
+    if (highlightName && row[nameField] === highlightName) li.classList.add("me");
     const rankSpan = document.createElement("span");
     rankSpan.className = "rank";
     rankSpan.textContent = "#" + (idx + 1);
     const nameSpan = document.createElement("span");
     nameSpan.className = "lname";
-    nameSpan.textContent = row.name || "???";
+    nameSpan.textContent = row[nameField] || "???";
     const scoreSpan = document.createElement("span");
     scoreSpan.className = "lscore";
-    scoreSpan.textContent = row.score;
+    scoreSpan.textContent = row[scoreField];
     li.appendChild(rankSpan);
     li.appendChild(nameSpan);
     li.appendChild(scoreSpan);
@@ -788,13 +1136,17 @@ function updateLiveLeaderboard(dt) {
     const rankSpan = document.createElement("span");
     rankSpan.className = "rank";
     rankSpan.textContent = "#" + (idx + 1);
+    const swatch = document.createElement("span");
+    swatch.className = "lswatch";
+    swatch.style.background = s.color1;
     const nameSpan = document.createElement("span");
     nameSpan.className = "lname";
-    nameSpan.textContent = s.name;
+    nameSpan.textContent = s.name || "(unnamed)";
     const scoreSpan = document.createElement("span");
     scoreSpan.className = "lscore";
     scoreSpan.textContent = s.length;
     li.appendChild(rankSpan);
+    li.appendChild(swatch);
     li.appendChild(nameSpan);
     li.appendChild(scoreSpan);
     liveList.appendChild(li);
@@ -803,9 +1155,14 @@ function updateLiveLeaderboard(dt) {
 
 async function refreshLeaderboard() {
   const data = await fetchLeaderboard();
-  leaderboardCache = data;
   const menuList = document.getElementById("menuLeaderboardList");
-  if (menuList) renderLeaderboardList(menuList, data, playerName);
+  if (menuList) renderLeaderboardList(menuList, data, "name", "latest_score", playerName);
+}
+
+async function refreshTopLeaderboard() {
+  const data = await fetchBestLeaderboard();
+  const topList = document.getElementById("topLeaderboardList");
+  if (topList) renderLeaderboardList(topList, data, "name", "best_score", playerName);
 }
 
 function startLeaderboardPolling() {
@@ -877,12 +1234,15 @@ function updateMenuStatsDisplay() {
 const menuEl = () => document.getElementById("menu");
 const gameUIEl = () => document.getElementById("gameUI");
 const deathScreenEl = () => document.getElementById("deathScreen");
+const topLeaderboardEl = () => document.getElementById("topLeaderboardOverlay");
 
 function setupMenuUI() {
   const nameInput = document.getElementById("nameInput");
   const playBtn = document.getElementById("playBtn");
   const modePvA = document.getElementById("modePvA");
   const modeOnline = document.getElementById("modeOnline");
+  const modeTop = document.getElementById("modeTopLeaderboard");
+  const closeTopBtn = document.getElementById("closeTopLeaderboard");
 
   try {
     if (modePvA && modeOnline) {
@@ -893,6 +1253,22 @@ function setupMenuUI() {
     }
   } catch (err) {
     console.error("Failed to bind mode buttons:", err);
+  }
+
+  try {
+    if (modeTop) {
+      modeTop.addEventListener("click", () => {
+        refreshTopLeaderboard();
+        topLeaderboardEl().classList.remove("hidden");
+      });
+    }
+    if (closeTopBtn) {
+      closeTopBtn.addEventListener("click", () => {
+        topLeaderboardEl().classList.add("hidden");
+      });
+    }
+  } catch (err) {
+    console.error("Failed to bind top leaderboard button:", err);
   }
 
   try {
@@ -925,12 +1301,6 @@ function setupMenuUI() {
     if (playBtn && nameInput) {
       playBtn.addEventListener("click", () => {
         const name = nameInput.value.trim();
-        if (!name) {
-          nameInput.focus();
-          nameInput.style.borderColor = "#ff6b6b";
-          setTimeout(() => { nameInput.style.borderColor = ""; }, 900);
-          return;
-        }
         playerName = name.slice(0, 16);
         startGame();
       });
@@ -954,33 +1324,6 @@ function setupMenuUI() {
   updateMenuStatsDisplay();
 }
 
-function setupDeathUI() {
-  try {
-    const respawnBtn = document.getElementById("respawnBtn");
-    const respawnNameInput = document.getElementById("respawnNameInput");
-    if (respawnBtn) {
-      respawnBtn.addEventListener("click", () => {
-        const name = respawnNameInput ? respawnNameInput.value.trim() : playerName;
-        if (name) playerName = name.slice(0, 16);
-        deathScreenEl().classList.add("hidden");
-        startGame();
-      });
-    } else {
-      console.error("Respawn button not found in DOM.");
-    }
-  } catch (err) {
-    console.error("Failed to bind respawn button:", err);
-  }
-}
-
-function showDeathScreen() {
-  const statsEl = document.getElementById("deathStats");
-  statsEl.textContent = `Your final length was ${player.length}! Boops: ${player.boops}`;
-  const respawnNameInput = document.getElementById("respawnNameInput");
-  if (respawnNameInput) respawnNameInput.value = playerName;
-  deathScreenEl().classList.remove("hidden");
-}
-
 function computeLiveRank() {
   const all = [player, ...aiSnakes].filter(s => s && s.alive);
   const sorted = all.slice().sort((a, b) => b.length - a.length);
@@ -995,27 +1338,15 @@ function updateHUD() {
 }
 
 function drawGrid() {
-  const hexSize = 34;
-  const hexW = hexSize * 2;
-  const hexH = Math.sqrt(3) * hexSize;
+  const patternSize = 340;
+  const startX = Math.floor((camera.x - (W / camera.zoom) / 2 - patternSize) / patternSize) * patternSize;
+  const endX = camera.x + (W / camera.zoom) / 2 + patternSize;
+  const startY = Math.floor((camera.y - (H / camera.zoom) / 2 - patternSize) / patternSize) * patternSize;
+  const endY = camera.y + (H / camera.zoom) / 2 + patternSize;
 
-  const viewLeft = camera.x - (W / camera.zoom) / 2 - hexW;
-  const viewRight = camera.x + (W / camera.zoom) / 2 + hexW;
-  const viewTop = camera.y - (H / camera.zoom) / 2 - hexH;
-  const viewBottom = camera.y + (H / camera.zoom) / 2 + hexH;
-
-  const colStep = hexW * 0.75;
-  const startCol = Math.floor(viewLeft / colStep) - 1;
-  const endCol = Math.ceil(viewRight / colStep) + 1;
-
-  for (let col = startCol; col <= endCol; col++) {
-    const x = col * colStep;
-    const yOffset = (col % 2 !== 0) ? hexH / 2 : 0;
-    const startRow = Math.floor((viewTop - yOffset) / hexH) - 1;
-    const endRow = Math.ceil((viewBottom - yOffset) / hexH) + 1;
-    for (let row = startRow; row <= endRow; row++) {
-      const y = row * hexH + yOffset;
-      drawHexCell(x, y, hexSize);
+  for (let px = startX; px <= endX; px += patternSize) {
+    for (let py = startY; py <= endY; py += patternSize) {
+      drawHexCluster(px, py);
     }
   }
 
@@ -1034,6 +1365,24 @@ function drawGrid() {
   ctx.fillStyle = "rgba(120,10,10,0.35)";
   ctx.fillRect(0, 0, W, H);
   ctx.restore();
+}
+
+function drawHexCluster(originX, originY) {
+  const hexSize = 34;
+  const hexW = hexSize * 2;
+  const hexH = Math.sqrt(3) * hexSize;
+  const colStep = hexW * 0.75;
+  const cols = 5;
+  const rows = 4;
+
+  for (let col = 0; col < cols; col++) {
+    const x = originX + col * colStep;
+    const yOffset = (col % 2 !== 0) ? hexH / 2 : 0;
+    for (let row = 0; row < rows; row++) {
+      const y = originY + row * hexH + yOffset;
+      drawHexCell(x, y, hexSize);
+    }
+  }
 }
 
 function drawHexCell(cx, cy, size) {
@@ -1173,10 +1522,12 @@ function drawSnake(snake) {
     ctx.fill();
   }
 
-  ctx.font = "13px Segoe UI";
-  ctx.fillStyle = "rgba(255,255,255,0.85)";
-  ctx.textAlign = "center";
-  ctx.fillText(snake.name, head.x, head.y + r + 16);
+  if (snake.name) {
+    ctx.font = "13px Segoe UI";
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.textAlign = "center";
+    ctx.fillText(snake.name, head.x, head.y + r + 16);
+  }
 }
 
 function drawMinimap() {
@@ -1191,32 +1542,45 @@ function drawMinimap() {
   minimapCtx.lineWidth = 2;
   minimapCtx.stroke();
 
-  const scale = size / (worldRadius * 2);
+  if (!player || !player.alive) return;
+
+  const viewRadius = worldRadius * 0.35;
+  const scale = (size / 2) / viewRadius;
+  const px = player.segments[0].x;
+  const py = player.segments[0].y;
+
   const toMini = (x, y) => ({
-    x: (x + worldRadius) * scale,
-    y: (y + worldRadius) * scale
+    x: size / 2 + (x - px) * scale,
+    y: size / 2 + (y - py) * scale
   });
 
-  function dotRadiusForLength(length) {
-    return Math.min(6, 1.5 + Math.sqrt(length) * 0.35);
-  }
+  minimapCtx.save();
+  minimapCtx.beginPath();
+  minimapCtx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
+  minimapCtx.clip();
 
   for (let s of aiSnakes) {
     if (!s.alive) continue;
-    const p = toMini(s.segments[0].x, s.segments[0].y);
-    minimapCtx.fillStyle = s.color1;
+    const segs = s.segments;
+    if (segs.length < 2) continue;
+    minimapCtx.strokeStyle = s.color1;
+    minimapCtx.lineWidth = 1.5;
     minimapCtx.beginPath();
-    minimapCtx.arc(p.x, p.y, dotRadiusForLength(s.length), 0, Math.PI * 2);
-    minimapCtx.fill();
+    for (let i = 0; i < segs.length; i += 3) {
+      const p = toMini(segs[i].x, segs[i].y);
+      if (i === 0) minimapCtx.moveTo(p.x, p.y);
+      else minimapCtx.lineTo(p.x, p.y);
+    }
+    minimapCtx.stroke();
   }
 
-  if (player && player.alive) {
-    const p = toMini(player.segments[0].x, player.segments[0].y);
-    minimapCtx.fillStyle = "#fff";
-    minimapCtx.beginPath();
-    minimapCtx.arc(p.x, p.y, dotRadiusForLength(player.length), 0, Math.PI * 2);
-    minimapCtx.fill();
-  }
+  minimapCtx.restore();
+
+  const centerP = toMini(px, py);
+  minimapCtx.fillStyle = "#fff";
+  minimapCtx.beginPath();
+  minimapCtx.arc(centerP.x, centerP.y, 4, 0, Math.PI * 2);
+  minimapCtx.fill();
 }
 
 function render() {
@@ -1248,13 +1612,17 @@ function gameStep(dt) {
 
   if (player && player.alive) player.move(dt);
 
+  const allSnakesForPerception = [player, ...aiSnakes].filter(s => s && s.alive);
+  rebuildSpatialGrids(allSnakesForPerception);
+
   for (let ai of aiSnakes) {
     if (!ai.alive) continue;
-    ai.think([player, ...aiSnakes], dt);
+    ai.think(allSnakesForPerception, dt);
     ai.move(dt);
   }
 
   updateWorldRadius();
+  updateFoodWobble(dt);
   checkCollisions();
   updateLiveLeaderboard(dt);
 
@@ -1287,10 +1655,13 @@ function onPlayerDeath() {
   const finalLength = player.length;
   const finalBoops = player.boops;
   saveLocalStats(finalLength, finalBoops);
-  saveScore(playerName, finalLength, finalBoops).then(() => {
+  syncLiveStats(playerName, finalLength, finalBoops).then(() => {
     refreshLeaderboard();
   });
-  showDeathScreen();
+  gameUIEl().classList.add("hidden");
+  deathScreenEl().classList.add("hidden");
+  menuEl().classList.remove("hidden");
+  updateMenuStatsDisplay();
 }
 
 function startGame() {
@@ -1316,11 +1687,11 @@ function startGame() {
 
     camera.x = spawn.x;
     camera.y = spawn.y;
-    camera.zoom = ZOOM_MAX;
-    camera.targetZoom = ZOOM_MAX;
+    camera.zoom = zoomForLength(player.length);
 
     lastTime = 0;
     gameRunning = true;
+    incrementGamesCount();
     requestAnimationFrame(loop);
   } catch (err) {
     console.error("startGame failed:", err);
@@ -1344,8 +1715,8 @@ function init() {
 
     setupInput();
     setupMenuUI();
-    setupDeathUI();
     startLeaderboardPolling();
+    ensureUniqueUuid();
 
     console.log("Game initialized successfully.");
   } catch (err) {
