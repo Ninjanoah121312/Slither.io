@@ -307,9 +307,9 @@ const FOOD_MIN_RADIUS = 4;
 const FOOD_MAX_RADIUS = 10;
 const FOOD_MIN_VALUE = 1;
 const FOOD_MAX_VALUE = 10;
-const FOOD_LOCAL_DENSITY_RADIUS = 1400;
-const FOOD_LOCAL_TARGET_PER_SNAKE = 90;
-const FOOD_GLOBAL_MAX = 3600;
+const FOOD_LOCAL_DENSITY_RADIUS = 1800;
+const FOOD_LOCAL_TARGET_PER_SNAKE = 700;
+const FOOD_GLOBAL_MAX = 20000;
 const FOOD_WOBBLE_RADIUS = 8;
 const FOOD_WOBBLE_SPEED = 0.6;
 
@@ -322,7 +322,6 @@ const BASE_SEGMENT_SPACING = 6.5;
 const BASE_HEAD_RADIUS = 10;
 
 const START_LENGTH = 20;
-const SCORE_PER_KILL = 50;
 const BOOPS_PER_KILL = 1;
 
 const GROWTH_SLOWDOWN_START = 150;
@@ -553,11 +552,17 @@ function spawnRandomFoodValue() {
   return 1;
 }
 
+let fillFoodRoundRobinIndex = 0;
 function fillFoodNearSnakes(allSnakes) {
   if (foods.length >= FOOD_GLOBAL_MAX) return;
+  if (allSnakes.length === 0) return;
 
-  for (let snake of allSnakes) {
+  const snakesToCheck = Math.min(allSnakes.length, 40);
+  for (let i = 0; i < snakesToCheck; i++) {
     if (foods.length >= FOOD_GLOBAL_MAX) break;
+    const snake = allSnakes[fillFoodRoundRobinIndex % allSnakes.length];
+    fillFoodRoundRobinIndex++;
+
     const head = snake.segments[0];
     let localCount = 0;
     forEachNearbyFood(head.x, head.y, FOOD_LOCAL_DENSITY_RADIUS, () => {
@@ -566,7 +571,7 @@ function fillFoodNearSnakes(allSnakes) {
     });
     let needed = FOOD_LOCAL_TARGET_PER_SNAKE - localCount;
     needed = Math.min(needed, 40);
-    for (let i = 0; i < needed && foods.length < FOOD_GLOBAL_MAX; i++) {
+    for (let i2 = 0; i2 < needed && foods.length < FOOD_GLOBAL_MAX; i2++) {
       const p = randomPointNear(head.x, head.y, FOOD_LOCAL_DENSITY_RADIUS);
       const distFromCenter = Math.hypot(p.x, p.y);
       if (distFromCenter > worldRadius - 20) continue;
@@ -755,7 +760,6 @@ class Snake {
   }
 
   registerKill() {
-    this.grow(SCORE_PER_KILL);
     this.boops += BOOPS_PER_KILL;
   }
 
@@ -1501,16 +1505,24 @@ function updateHUD() {
   document.getElementById("rankPositionVal").textContent = `${rank} of ${total}`;
 }
 
+const HEX_SIZE = 34;
+const HEX_W = HEX_SIZE * 2;
+const HEX_H = Math.sqrt(3) * HEX_SIZE;
+const HEX_COL_STEP = HEX_W * 0.75;
+const CLUSTER_COLS = 6;
+const CLUSTER_ROWS = 5;
+const CLUSTER_STRIDE_X = HEX_COL_STEP * CLUSTER_COLS;
+const CLUSTER_STRIDE_Y = HEX_H * CLUSTER_ROWS;
+
 function drawGrid() {
   const highQuality = graphicsQuality === "high";
-  const patternSize = 340;
-  const startX = Math.floor((camera.x - (W / camera.zoom) / 2 - patternSize) / patternSize) * patternSize;
-  const endX = camera.x + (W / camera.zoom) / 2 + patternSize;
-  const startY = Math.floor((camera.y - (H / camera.zoom) / 2 - patternSize) / patternSize) * patternSize;
-  const endY = camera.y + (H / camera.zoom) / 2 + patternSize;
+  const startX = Math.floor((camera.x - (W / camera.zoom) / 2) / CLUSTER_STRIDE_X - 1) * CLUSTER_STRIDE_X;
+  const endX = camera.x + (W / camera.zoom) / 2 + CLUSTER_STRIDE_X;
+  const startY = Math.floor((camera.y - (H / camera.zoom) / 2) / CLUSTER_STRIDE_Y - 1) * CLUSTER_STRIDE_Y;
+  const endY = camera.y + (H / camera.zoom) / 2 + CLUSTER_STRIDE_Y;
 
-  for (let px = startX; px <= endX; px += patternSize) {
-    for (let py = startY; py <= endY; py += patternSize) {
+  for (let px = startX; px <= endX; px += CLUSTER_STRIDE_X) {
+    for (let py = startY; py <= endY; py += CLUSTER_STRIDE_Y) {
       drawHexCluster(px, py, highQuality);
     }
   }
@@ -1533,19 +1545,12 @@ function drawGrid() {
 }
 
 function drawHexCluster(originX, originY, highQuality) {
-  const hexSize = 34;
-  const hexW = hexSize * 2;
-  const hexH = Math.sqrt(3) * hexSize;
-  const colStep = hexW * 0.75;
-  const cols = 5;
-  const rows = 4;
-
-  for (let col = 0; col < cols; col++) {
-    const x = originX + col * colStep;
-    const yOffset = (col % 2 !== 0) ? hexH / 2 : 0;
-    for (let row = 0; row < rows; row++) {
-      const y = originY + row * hexH + yOffset;
-      drawHexCell(x, y, hexSize, highQuality);
+  for (let col = 0; col < CLUSTER_COLS; col++) {
+    const x = originX + col * HEX_COL_STEP;
+    const yOffset = (col % 2 !== 0) ? HEX_H / 2 : 0;
+    for (let row = 0; row < CLUSTER_ROWS; row++) {
+      const y = originY + row * HEX_H + yOffset;
+      drawHexCell(x, y, HEX_SIZE, highQuality);
     }
   }
 }
