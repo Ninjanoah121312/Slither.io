@@ -475,6 +475,15 @@ html, body {
   white-space: nowrap;
 }
 
+body.low-quality #menu {
+  background: #0b0e14;
+}
+
+body.low-quality .menu-box {
+  backdrop-filter: none;
+  box-shadow: none;
+}
+
 .__fatalErrorBox {
   position: fixed;
   top: 0;
