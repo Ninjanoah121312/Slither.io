@@ -78,48 +78,61 @@ function generateCandidateUuid() {
   return 1 + Math.floor(Math.random() * 2147483646);
 }
 
+let uuidPromise = null;
 async function ensureUniqueUuid() {
-  const client = getSupabaseClient();
-  let existing = getLocalUuid();
-  if (existing !== null) return existing;
+  if (uuidPromise) return uuidPromise;
 
-  if (!client) {
+  uuidPromise = (async () => {
+    let existing = getLocalUuid();
+    if (existing !== null) return existing;
+
+    const client = getSupabaseClient();
+    if (!client) {
+      const fallback = generateCandidateUuid();
+      setLocalUuid(fallback);
+      return fallback;
+    }
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const candidate = generateCandidateUuid();
+      try {
+        const { data, error } = await client.from("data").select("uuid").eq("uuid", candidate).limit(1);
+        if (error) {
+          console.error("UUID uniqueness check failed:", error.message || error);
+          setLocalUuid(candidate);
+          return candidate;
+        }
+        if (!data || data.length === 0) {
+          setLocalUuid(candidate);
+          return candidate;
+        }
+      } catch (err) {
+        console.error("UUID uniqueness check exception:", err);
+        setLocalUuid(candidate);
+        return candidate;
+      }
+    }
     const fallback = generateCandidateUuid();
     setLocalUuid(fallback);
     return fallback;
-  }
+  })();
 
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const candidate = generateCandidateUuid();
-    try {
-      const { data, error } = await client.from("data").select("uuid").eq("uuid", candidate).limit(1);
-      if (error) {
-        console.error("UUID uniqueness check failed:", error.message || error);
-        setLocalUuid(candidate);
-        return candidate;
-      }
-      if (!data || data.length === 0) {
-        setLocalUuid(candidate);
-        return candidate;
-      }
-    } catch (err) {
-      console.error("UUID uniqueness check exception:", err);
-      setLocalUuid(candidate);
-      return candidate;
-    }
-  }
-  const fallback = generateCandidateUuid();
-  setLocalUuid(fallback);
-  return fallback;
+  return uuidPromise;
 }
 
-async function upsertPlayerRow(fields) {
+let rowEnsuredPromise = null;
+let writeQueue = Promise.resolve();
+
+function queueSupabaseWrite(fn) {
+  writeQueue = writeQueue.then(fn).catch((err) => {
+    console.error("Queued Supabase write failed:", err);
+  });
+  return writeQueue;
+}
+
+async function ensureRowExists(uuid, initialFields) {
   const client = getSupabaseClient();
-  if (!client) {
-    console.warn("Supabase unavailable; data was not saved online.");
-    return false;
-  }
-  const uuid = await ensureUniqueUuid();
+  if (!client) return false;
   try {
     const { data: existingRows, error: selectError } = await client
       .from("data")
@@ -127,52 +140,70 @@ async function upsertPlayerRow(fields) {
       .eq("uuid", uuid)
       .limit(1);
     if (selectError) {
-      console.error("Supabase select-before-upsert failed:", selectError.message || selectError);
+      console.error("Supabase select-before-insert failed:", selectError.message || selectError);
+      return false;
     }
+    if (existingRows && existingRows.length > 0) return true;
 
-    const rowExists = existingRows && existingRows.length > 0;
-    const payload = Object.assign({ uuid: uuid }, fields);
-
-    if (rowExists) {
-      const { error } = await client.from("data").update(fields).eq("uuid", uuid);
-      if (error) {
-        console.error("Supabase update failed:", error.message || error);
-        return false;
-      }
-    } else {
-      const { error } = await client.from("data").insert([payload]);
-      if (error) {
-        console.error("Supabase insert failed:", error.message || error);
-        return false;
-      }
+    const { error: insertError } = await client
+      .from("data")
+      .insert([Object.assign({ uuid: uuid }, initialFields)]);
+    if (insertError) {
+      if (String(insertError.code) === "23505") return true;
+      console.error("Supabase initial insert failed:", insertError.message || insertError);
+      return false;
     }
     return true;
   } catch (err) {
-    console.error("Supabase upsert exception:", err);
+    console.error("Supabase ensureRowExists exception:", err);
     return false;
   }
 }
 
-async function syncLiveStats(name, latestScore, latestBoops) {
-  const fields = {
-    name: name,
-    latest_score: Math.round(latestScore),
-    latest_boops: Math.round(latestBoops),
-    latest_score_time: new Date().toISOString(),
-    latest_game_mode: "pva",
-    current_game_mode: "pva"
-  };
-
-  const cachedBest = getCachedBest();
-  if (!cachedBest || latestScore > cachedBest.best_score) {
-    fields.best_score = Math.round(latestScore);
-    fields.best_boops = Math.round(latestBoops);
-    fields.best_score_time = new Date().toISOString();
-    fields.best_game_mode = "pva";
-    setCachedBest({ best_score: Math.round(latestScore), best_boops: Math.round(latestBoops), best_score_time: fields.best_score_time });
+async function writeFieldsForUuid(uuid, fields) {
+  const client = getSupabaseClient();
+  if (!client) {
+    console.warn("Supabase unavailable; data was not saved online.");
+    return false;
   }
+  const ok = await ensureRowExists(uuid, fields);
+  if (!ok) return false;
+  try {
+    const { error } = await client.from("data").update(fields).eq("uuid", uuid);
+    if (error) {
+      console.error("Supabase update failed:", error.message || error);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error("Supabase update exception:", err);
+    return false;
+  }
+}
 
-  return upsertPlayerRow(fields);
+function syncLiveStats(name, latestScore, latestBoops) {
+  return queueSupabaseWrite(async () => {
+    const uuid = await ensureUniqueUuid();
+    const fields = {
+      name: name,
+      latest_score: Math.round(latestScore),
+      latest_boops: Math.round(latestBoops),
+      latest_score_time: new Date().toISOString(),
+      latest_game_mode: "pva",
+      current_game_mode: "pva"
+    };
+
+    const cachedBest = getCachedBest();
+    if (!cachedBest || latestScore > cachedBest.best_score) {
+      fields.best_score = Math.round(latestScore);
+      fields.best_boops = Math.round(latestBoops);
+      fields.best_score_time = new Date().toISOString();
+      fields.best_game_mode = "pva";
+      setCachedBest({ best_score: Math.round(latestScore), best_boops: Math.round(latestBoops), best_score_time: fields.best_score_time });
+    }
+
+    return writeFieldsForUuid(uuid, fields);
+  });
 }
 
 let cachedBestStats = null;
@@ -194,30 +225,38 @@ function setCachedBest(obj) {
   } catch (e) {}
 }
 
-async function incrementGamesCount() {
-  const client = getSupabaseClient();
-  if (!client) return;
-  const uuid = await ensureUniqueUuid();
-  try {
-    const { data: existingRows, error: selectError } = await client
-      .from("data")
-      .select("ai_games_count")
-      .eq("uuid", uuid)
-      .limit(1);
-    if (selectError) {
-      console.error("Supabase select-before-increment failed:", selectError.message || selectError);
+function incrementGamesCount() {
+  return queueSupabaseWrite(async () => {
+    const client = getSupabaseClient();
+    if (!client) return false;
+    const uuid = await ensureUniqueUuid();
+    const ok = await ensureRowExists(uuid, { name: playerName || "", ai_games_count: 0 });
+    if (!ok) return false;
+    try {
+      const { data: existingRows, error: selectError } = await client
+        .from("data")
+        .select("ai_games_count")
+        .eq("uuid", uuid)
+        .limit(1);
+      if (selectError) {
+        console.error("Supabase select-before-increment failed:", selectError.message || selectError);
+        return false;
+      }
+      const currentCount = (existingRows && existingRows[0] && existingRows[0].ai_games_count) || 0;
+      const { error } = await client
+        .from("data")
+        .update({ ai_games_count: currentCount + 1, current_game_mode: "pva" })
+        .eq("uuid", uuid);
+      if (error) {
+        console.error("Supabase increment failed:", error.message || error);
+        return false;
+      }
+      return true;
+    } catch (err) {
+      console.error("Supabase increment exception:", err);
+      return false;
     }
-    const rowExists = existingRows && existingRows.length > 0;
-    const currentCount = rowExists && existingRows[0].ai_games_count ? existingRows[0].ai_games_count : 0;
-    const fields = { ai_games_count: currentCount + 1, current_game_mode: "pva" };
-    if (rowExists) {
-      await client.from("data").update(fields).eq("uuid", uuid);
-    } else {
-      await client.from("data").insert([Object.assign({ uuid: uuid, name: playerName || "" }, fields)]);
-    }
-  } catch (err) {
-    console.error("Supabase increment games count exception:", err);
-  }
+  });
 }
 
 async function fetchLeaderboard() {
@@ -268,8 +307,9 @@ const FOOD_MIN_RADIUS = 4;
 const FOOD_MAX_RADIUS = 10;
 const FOOD_MIN_VALUE = 1;
 const FOOD_MAX_VALUE = 10;
-const FOOD_DENSITY_PER_AREA = 0.00045;
-const FOOD_MAX_CAP = 6000;
+const FOOD_LOCAL_DENSITY_RADIUS = 1400;
+const FOOD_LOCAL_TARGET_PER_SNAKE = 90;
+const FOOD_GLOBAL_MAX = 3600;
 const FOOD_WOBBLE_RADIUS = 8;
 const FOOD_WOBBLE_SPEED = 0.6;
 
@@ -289,16 +329,15 @@ const GROWTH_SLOWDOWN_START = 150;
 const GROWTH_SLOWDOWN_MIN_MULT = 0.12;
 const GROWTH_RATE_MULT = 0.35;
 
-const MAX_THICKNESS_LENGTH = 6000;
+const MAX_THICKNESS_LENGTH = 1400;
 const MIN_RADIUS_MULT = 1.0;
-const MAX_RADIUS_MULT = 5.2;
+const MAX_RADIUS_MULT = 3.4;
 
 const MIN_BOOST_LENGTH = 10;
 const BOOST_TICK_INTERVAL = 100;
 const BOOST_LENGTH_PER_TICK = 1;
 const BOOST_FOOD_DROP_INTERVAL = 100;
 
-const SHRINK_ANIM_SPEED = 8;
 const GROW_ANIM_SPEED = 10;
 
 const CAMERA_LERP = 0.08;
@@ -331,7 +370,7 @@ const AI_NAME_BASES = [
   "Frost", "Glacier", "Storm", "Thunder", "Cyclone", "Tornado",
   "Quake", "Ripple", "Wave", "Current", "Undertow", "Tide",
   "Shadow", "Ghost", "Phantom", "Specter", "Wraith", "Reaper",
-  "Fang2", "Venom", "Toxin", "Poison", "Sting", "Bite", "Snare",
+  "Venom", "Toxin", "Poison", "Sting", "Bite", "Snare",
   "Trap", "Hunter", "Stalker", "Prowler", "Predator", "Scout",
   "Rogue", "Bandit", "Outlaw", "Renegade", "Maverick", "Nomad",
   "Wanderer", "Drifter", "Rambler", "Roamer", "Voyager", "Pioneer",
@@ -412,11 +451,6 @@ function updateWorldRadius() {
   worldRadius = WORLD_RADIUS_MAX - t * (WORLD_RADIUS_MAX - WORLD_RADIUS_MIN);
 }
 
-function getFoodTarget() {
-  const area = Math.PI * worldRadius * worldRadius;
-  return Math.min(1400, Math.max(200, Math.round(area * FOOD_DENSITY_PER_AREA)));
-}
-
 const input = {
   mouseX: W / 2,
   mouseY: H / 2,
@@ -453,8 +487,8 @@ function setupInput() {
 }
 
 function zoomForLength(length) {
-  const t = Math.min(1, Math.max(0, (length - START_LENGTH) / 2000));
-  return 2.3 - t * 1.5;
+  const t = Math.min(1, Math.max(0, (length - START_LENGTH) / 1400));
+  return 1.4 - t * 0.75;
 }
 
 function updateCamera(target) {
@@ -506,18 +540,38 @@ function randomPointInWorld(marginFromEdge) {
   return { x: Math.cos(theta) * r, y: Math.sin(theta) * r };
 }
 
-function fillFoodToTarget() {
-  const target = getFoodTarget();
-  while (foods.length < target) {
-    const roll = Math.random();
-    let value = 1;
-    if (roll > 0.985) value = 5 + Math.floor(Math.random() * 6);
-    else if (roll > 0.9) value = 2 + Math.floor(Math.random() * 3);
-    const p = randomPointInWorld(30);
-    spawnFood(p.x, p.y, value);
-  }
-  if (foods.length > target + 200) {
-    foods.length = target;
+function randomPointNear(cx, cy, radius) {
+  const r = radius * Math.sqrt(Math.random());
+  const theta = Math.random() * Math.PI * 2;
+  return { x: cx + Math.cos(theta) * r, y: cy + Math.sin(theta) * r };
+}
+
+function spawnRandomFoodValue() {
+  const roll = Math.random();
+  if (roll > 0.985) return 5 + Math.floor(Math.random() * 6);
+  if (roll > 0.9) return 2 + Math.floor(Math.random() * 3);
+  return 1;
+}
+
+function fillFoodNearSnakes(allSnakes) {
+  if (foods.length >= FOOD_GLOBAL_MAX) return;
+
+  for (let snake of allSnakes) {
+    if (foods.length >= FOOD_GLOBAL_MAX) break;
+    const head = snake.segments[0];
+    let localCount = 0;
+    forEachNearbyFood(head.x, head.y, FOOD_LOCAL_DENSITY_RADIUS, () => {
+      localCount++;
+      return false;
+    });
+    let needed = FOOD_LOCAL_TARGET_PER_SNAKE - localCount;
+    needed = Math.min(needed, 40);
+    for (let i = 0; i < needed && foods.length < FOOD_GLOBAL_MAX; i++) {
+      const p = randomPointNear(head.x, head.y, FOOD_LOCAL_DENSITY_RADIUS);
+      const distFromCenter = Math.hypot(p.x, p.y);
+      if (distFromCenter > worldRadius - 20) continue;
+      spawnFood(p.x, p.y, spawnRandomFoodValue());
+    }
   }
 }
 
@@ -617,6 +671,7 @@ class Snake {
         this.boostTickAccum -= BOOST_TICK_INTERVAL;
         if (this.segmentCount > MIN_BOOST_LENGTH) {
           this.segmentCount = Math.max(MIN_BOOST_LENGTH, this.segmentCount - BOOST_LENGTH_PER_TICK);
+          if (this.displaySegmentCount > this.segmentCount) this.displaySegmentCount = this.segmentCount;
         } else {
           this.boosting = false;
         }
@@ -639,12 +694,11 @@ class Snake {
 
     this.rebuildSegmentsFromPath();
 
-    if (this.displaySegmentCount > this.segmentCount) {
-      this.displaySegmentCount -= SHRINK_ANIM_SPEED * dtSeconds;
-      if (this.displaySegmentCount < this.segmentCount) this.displaySegmentCount = this.segmentCount;
-    } else if (this.displaySegmentCount < this.segmentCount) {
+    if (this.displaySegmentCount < this.segmentCount) {
       this.displaySegmentCount += GROW_ANIM_SPEED * dtSeconds;
       if (this.displaySegmentCount > this.segmentCount) this.displaySegmentCount = this.segmentCount;
+    } else if (this.displaySegmentCount > this.segmentCount) {
+      this.displaySegmentCount = this.segmentCount;
     }
 
     this.eyeBlink += dtSeconds * 5;
@@ -767,7 +821,6 @@ class AISnake extends Snake {
     const turnRadius = this.speed / TURN_RATE;
 
     let closestFood = null;
-    let closestFoodScore = -Infinity;
     const searchRadius = 420;
 
     if (this.stickyFoodTarget) {
@@ -843,7 +896,6 @@ class AISnake extends Snake {
         if (t.isSelf) continue;
         const otherHead = t.snake.segments[0];
         const headDx = otherHead.x - head.x, headDy = otherHead.y - head.y;
-        const headDist = Math.hypot(headDx, headDy);
         const closingAngle = Math.atan2(headDy, headDx);
         const otherHeading = t.snake.angle;
         let headOnFactor = Math.cos(otherHeading - (closingAngle + Math.PI));
@@ -1072,17 +1124,22 @@ function forEachNearbyFood(x, y, radius, callback) {
 function killSnake(snake, killer) {
   snake.alive = false;
 
-  const segs = snake.segments;
+  const segs = snake.segments.slice();
   const totalValue = Math.max(1, snake.length);
   const dropSpacing = 3;
   const dropCount = Math.max(1, Math.floor(segs.length / dropSpacing));
   const valuePerDrop = Math.min(FOOD_MAX_VALUE, Math.max(FOOD_MIN_VALUE, Math.round(totalValue / dropCount / 2)));
+  const dropPositions = [];
   for (let i = 0; i < segs.length; i += dropSpacing) {
-    spawnFood(segs[i].x, segs[i].y, valuePerDrop, snake.color1);
+    dropPositions.push({ x: segs[i].x, y: segs[i].y });
   }
 
   if (killer && killer.alive && killer !== snake) {
     killer.registerKill();
+  }
+
+  for (let p of dropPositions) {
+    spawnFood(p.x, p.y, valuePerDrop, snake.color1);
   }
 
   if (snake.isPlayer) {
@@ -1173,7 +1230,7 @@ function checkCollisions() {
     spawnOneAI();
   }
 
-  fillFoodToTarget();
+  fillFoodNearSnakes(allSnakes);
 }
 
 function randomSpawnPoint() {
@@ -1190,6 +1247,15 @@ function spawnOneAI() {
 function initAISnakes() {
   aiSnakes = [];
   for (let i = 0; i < AI_COUNT_BASE; i++) spawnOneAI();
+}
+
+function initialFoodBurst() {
+  const allSnakes = [player, ...aiSnakes].filter(s => s && s.alive);
+  rebuildSpatialGrids(allSnakes);
+  for (let pass = 0; pass < 6; pass++) {
+    fillFoodNearSnakes(allSnakes);
+    rebuildSpatialGrids([player, ...aiSnakes].filter(s => s && s.alive));
+  }
 }
 
 function renderLeaderboardList(listEl, data, nameField, scoreField, highlightName) {
@@ -1256,21 +1322,10 @@ function updateLiveLeaderboard(dt) {
   });
 }
 
-async function refreshLeaderboard() {
-  const data = await fetchLeaderboard();
-  const menuList = document.getElementById("menuLeaderboardList");
-  if (menuList) renderLeaderboardList(menuList, data, "name", "latest_score", playerName);
-}
-
 async function refreshTopLeaderboard() {
   const data = await fetchBestLeaderboard();
   const topList = document.getElementById("topLeaderboardList");
   if (topList) renderLeaderboardList(topList, data, "name", "best_score", playerName);
-}
-
-function startLeaderboardPolling() {
-  refreshLeaderboard();
-  setInterval(refreshLeaderboard, 10000);
 }
 
 function formatTimestamp(iso) {
@@ -1339,6 +1394,10 @@ const gameUIEl = () => document.getElementById("gameUI");
 const deathScreenEl = () => document.getElementById("deathScreen");
 const topLeaderboardEl = () => document.getElementById("topLeaderboardOverlay");
 
+function applyGraphicsQualityToBody() {
+  document.body.classList.toggle("low-quality", graphicsQuality === "low");
+}
+
 function setupMenuUI() {
   const nameInput = document.getElementById("nameInput");
   const playBtn = document.getElementById("playBtn");
@@ -1394,6 +1453,7 @@ function setupMenuUI() {
         qualityBtns.forEach((b) => b.classList.remove("active"));
         btn.classList.add("active");
         graphicsQuality = btn.dataset.quality;
+        applyGraphicsQualityToBody();
       });
     });
   } catch (err) {
@@ -1424,6 +1484,7 @@ function setupMenuUI() {
     console.error("Failed to bind Enter-key shortcut:", err);
   }
 
+  applyGraphicsQualityToBody();
   updateMenuStatsDisplay();
 }
 
@@ -1441,6 +1502,7 @@ function updateHUD() {
 }
 
 function drawGrid() {
+  const highQuality = graphicsQuality === "high";
   const patternSize = 340;
   const startX = Math.floor((camera.x - (W / camera.zoom) / 2 - patternSize) / patternSize) * patternSize;
   const endX = camera.x + (W / camera.zoom) / 2 + patternSize;
@@ -1449,14 +1511,14 @@ function drawGrid() {
 
   for (let px = startX; px <= endX; px += patternSize) {
     for (let py = startY; py <= endY; py += patternSize) {
-      drawHexCluster(px, py);
+      drawHexCluster(px, py, highQuality);
     }
   }
 
   const center = worldToScreen(0, 0);
   ctx.beginPath();
   ctx.arc(center.x, center.y, worldRadius * camera.zoom, 0, Math.PI * 2);
-  ctx.strokeStyle = "rgba(255,60,60,0.7)";
+  ctx.strokeStyle = "rgba(255,60,60,0.8)";
   ctx.lineWidth = 6;
   ctx.stroke();
 
@@ -1470,7 +1532,7 @@ function drawGrid() {
   ctx.restore();
 }
 
-function drawHexCluster(originX, originY) {
+function drawHexCluster(originX, originY, highQuality) {
   const hexSize = 34;
   const hexW = hexSize * 2;
   const hexH = Math.sqrt(3) * hexSize;
@@ -1483,12 +1545,12 @@ function drawHexCluster(originX, originY) {
     const yOffset = (col % 2 !== 0) ? hexH / 2 : 0;
     for (let row = 0; row < rows; row++) {
       const y = originY + row * hexH + yOffset;
-      drawHexCell(x, y, hexSize);
+      drawHexCell(x, y, hexSize, highQuality);
     }
   }
 }
 
-function drawHexCell(cx, cy, size) {
+function drawHexCell(cx, cy, size, highQuality) {
   const p = worldToScreen(cx, cy);
   const s = size * camera.zoom;
   if (p.x < -s * 2 || p.x > W + s * 2 || p.y < -s * 2 || p.y > H + s * 2) return;
@@ -1502,9 +1564,17 @@ function drawHexCell(cx, cy, size) {
     else ctx.lineTo(vx, vy);
   }
   ctx.closePath();
-  ctx.fillStyle = "#161b26";
+
+  if (highQuality) {
+    const grad = ctx.createRadialGradient(p.x, p.y - s * 0.3, s * 0.1, p.x, p.y, s * 1.1);
+    grad.addColorStop(0, "#1b212f");
+    grad.addColorStop(1, "#12151d");
+    ctx.fillStyle = grad;
+  } else {
+    ctx.fillStyle = "#171b25";
+  }
   ctx.fill();
-  ctx.strokeStyle = "#0c0f16";
+  ctx.strokeStyle = "#0a0c12";
   ctx.lineWidth = Math.max(1, 2 * camera.zoom);
   ctx.stroke();
 }
@@ -1548,7 +1618,7 @@ function drawFood() {
 function drawSnake(snake) {
   if (!snake.alive) return;
   const highQuality = graphicsQuality === "high";
-  const r = snake.headRadius * (snake.displaySegmentCount / Math.max(1, snake.segmentCount)) * camera.zoom;
+  const r = snake.headRadius * camera.zoom;
   const segs = snake.segments;
 
   ctx.lineJoin = "round";
@@ -1774,9 +1844,7 @@ function onPlayerDeath() {
   const finalLength = player.length;
   const finalBoops = player.boops;
   saveLocalStats(finalLength, finalBoops);
-  syncLiveStats(playerName, finalLength, finalBoops).then(() => {
-    refreshLeaderboard();
-  });
+  syncLiveStats(playerName, finalLength, finalBoops);
   gameUIEl().classList.add("hidden");
   deathScreenEl().classList.add("hidden");
   menuEl().classList.remove("hidden");
@@ -1802,7 +1870,7 @@ function startGame() {
     foods = [];
     initAISnakes();
     updateWorldRadius();
-    fillFoodToTarget();
+    initialFoodBurst();
 
     camera.x = spawn.x;
     camera.y = spawn.y;
@@ -1834,7 +1902,6 @@ function init() {
 
     setupInput();
     setupMenuUI();
-    startLeaderboardPolling();
     ensureUniqueUuid();
 
     console.log("Game initialized successfully.");
