@@ -299,17 +299,17 @@ async function fetchBestLeaderboard() {
   }
 }
 
-const WORLD_SIZE = 50000;
+const WORLD_SIZE = 60000;
 const WORLD_RADIUS_MAX = 30000;
 const WORLD_RADIUS_MIN = 10000;
 
-const FOOD_MIN_RADIUS = 1;
-const FOOD_MAX_RADIUS = 3;
+const FOOD_MIN_RADIUS = 4;
+const FOOD_MAX_RADIUS = 10;
 const FOOD_MIN_VALUE = 1;
 const FOOD_MAX_VALUE = 10;
-const FOOD_LOCAL_DENSITY_RADIUS = 1;
-const FOOD_LOCAL_TARGET_PER_SNAKE = 210;
-const FOOD_GLOBAL_MAX = 500000;
+const FOOD_LOCAL_DENSITY_RADIUS = 1800;
+const FOOD_LOCAL_TARGET_PER_SNAKE = 140;
+const FOOD_GLOBAL_MAX = 4000;
 const FOOD_WOBBLE_RADIUS = 8;
 const FOOD_WOBBLE_SPEED = 0.6;
 
@@ -629,7 +629,7 @@ function updateFoodWobble(dt) {
 }
 
 class Snake {
-  constructor(x, y, name, colorPair, isPlayer) {
+  constructor(x, y, name, colorPair, isPlayer, initialLength) {
     this.name = name;
     this.isPlayer = !!isPlayer;
     this.alive = true;
@@ -641,10 +641,11 @@ class Snake {
     this.boosting = false;
     this.boops = 0;
 
-    this.segmentCount = START_LENGTH;
-    this.displaySegmentCount = START_LENGTH;
+    const startLen = Math.max(4, Math.round(initialLength || START_LENGTH));
+    this.segmentCount = startLen;
+    this.displaySegmentCount = startLen;
     this.path = [];
-    const pathPoints = START_LENGTH * 6;
+    const pathPoints = startLen * 6;
     for (let i = 0; i < pathPoints; i++) {
       this.path.push({
         x: x - Math.cos(this.angle) * i * (BASE_SEGMENT_SPACING / 6),
@@ -681,7 +682,7 @@ class Snake {
     this.angle += diff;
   }
 
-  move(dt) {
+  move(dt, lowDetail) {
     const dtSeconds = Math.min(dt, 100) / 1000;
 
     this.applyTurn(dtSeconds);
@@ -720,17 +721,18 @@ class Snake {
         this.boostFoodDropAccum -= BOOST_FOOD_DROP_INTERVAL;
         const tailIdx = this.segments.length - 1;
         const tail = this.segments[tailIdx];
-        if (tail) spawnFood(tail.x, tail.y, 1, this.color1);
+        if (tail && foods.length < FOOD_GLOBAL_MAX) spawnFood(tail.x, tail.y, 1, this.color1);
       }
     } else {
       this.boostTickAccum = 0;
       this.boostFoodDropAccum = 0;
     }
 
+    const detailMult = lowDetail ? 6 : 1;
     const maxPathLen = Math.ceil(this.segmentCount * this.segmentSpacing) + 40;
     if (this.path.length > maxPathLen) this.path.length = maxPathLen;
 
-    this.rebuildSegmentsFromPath();
+    this.rebuildSegmentsFromPath(detailMult);
 
     if (this.displaySegmentCount < this.segmentCount) {
       this.displaySegmentCount += GROW_ANIM_SPEED * dtSeconds;
@@ -742,37 +744,55 @@ class Snake {
     this.eyeBlink += dtSeconds * 5;
   }
 
-  rebuildSegmentsFromPath() {
-    const spacing = this.segmentSpacing;
+  rebuildSegmentsFromPath(detailMult) {
+    const mult = detailMult || 1;
     const path = this.path;
-    const result = [path[0]];
-    let prev = path[0];
-    let accum = 0;
-    let idx = 1;
 
-    while (result.length < this.segmentCount) {
-      if (idx >= path.length) {
-        result.push(path[path.length - 1]);
-        continue;
+    if (mult === 1) {
+      const spacing = this.segmentSpacing;
+      const result = [path[0]];
+      let prev = path[0];
+      let accum = 0;
+      let idx = 1;
+
+      while (result.length < this.segmentCount) {
+        if (idx >= path.length) {
+          result.push(path[path.length - 1]);
+          continue;
+        }
+        const cur = path[idx];
+        const dx = cur.x - prev.x, dy = cur.y - prev.y;
+        const segDist = Math.hypot(dx, dy);
+        if (segDist < 1e-6) { idx++; continue; }
+        if (accum + segDist >= spacing) {
+          const t = (spacing - accum) / segDist;
+          const px = prev.x + dx * t;
+          const py = prev.y + dy * t;
+          result.push({ x: px, y: py });
+          prev = { x: px, y: py };
+          accum = 0;
+        } else {
+          accum += segDist;
+          prev = cur;
+          idx++;
+        }
       }
-      const cur = path[idx];
-      const dx = cur.x - prev.x, dy = cur.y - prev.y;
-      const segDist = Math.hypot(dx, dy);
-      if (segDist < 1e-6) { idx++; continue; }
-      if (accum + segDist >= spacing) {
-        const t = (spacing - accum) / segDist;
-        const px = prev.x + dx * t;
-        const py = prev.y + dy * t;
-        result.push({ x: px, y: py });
-        prev = { x: px, y: py };
-        accum = 0;
-      } else {
-        accum += segDist;
-        prev = cur;
-        idx++;
-      }
+
+      this.segments = result;
+      return;
     }
 
+    const targetCount = Math.max(6, Math.ceil(this.segmentCount / mult));
+    const stride = Math.max(1, Math.floor((path.length - 1) / Math.max(1, targetCount - 1)));
+    const result = [path[0]];
+    let idx = stride;
+    while (result.length < targetCount && idx < path.length) {
+      result.push(path[idx]);
+      idx += stride;
+    }
+    while (result.length < targetCount) {
+      result.push(path[path.length - 1]);
+    }
     this.segments = result;
   }
 
@@ -882,11 +902,12 @@ function killSnake(snake, killer) {
 
   const segs = snake.segments.slice();
   const totalValue = Math.max(1, snake.length);
-  const dropSpacing = 3;
+  const maxDropsPerDeath = 60;
+  const dropSpacing = Math.max(3, Math.ceil(segs.length / maxDropsPerDeath));
   const dropCount = Math.max(1, Math.floor(segs.length / dropSpacing));
   const valuePerDrop = Math.min(FOOD_MAX_VALUE, Math.max(FOOD_MIN_VALUE, Math.round(totalValue / dropCount / 2)));
   const dropPositions = [];
-  for (let i = 0; i < segs.length; i += dropSpacing) {
+  for (let i = 0; i < segs.length && dropPositions.length < maxDropsPerDeath; i += dropSpacing) {
     dropPositions.push({ x: segs[i].x, y: segs[i].y });
   }
 
@@ -895,6 +916,7 @@ function killSnake(snake, killer) {
   }
 
   for (let p of dropPositions) {
+    if (foods.length >= FOOD_GLOBAL_MAX) break;
     spawnFood(p.x, p.y, valuePerDrop, snake.color1);
   }
 
@@ -993,11 +1015,20 @@ function randomSpawnPoint() {
   return randomPointInWorld(400);
 }
 
+function rollAISpawnLength() {
+  const r = Math.random();
+  if (r < 0.55) return 8 + Math.random() * 60;
+  if (r < 0.85) return 60 + Math.random() * 240;
+  if (r < 0.97) return 300 + Math.random() * 700;
+  return 1000 + Math.random() * 1500;
+}
+
 function spawnOneAI() {
   const pos = randomSpawnPoint();
   const name = makeAIName();
   const colorPair = SNAKE_COLORS[(Math.random() * SNAKE_COLORS.length) | 0];
-  aiSnakes.push(new AISnake(pos.x, pos.y, name, colorPair));
+  const length = rollAISpawnLength();
+  aiSnakes.push(new AISnake(pos.x, pos.y, name, colorPair, length));
 }
 
 function initAISnakes() {
@@ -1558,10 +1589,10 @@ function gameStep(dt) {
 
     if (farAway) {
       ai.simpleFallbackThink(dt);
-      ai.move(dt);
+      ai.move(dt, true);
     } else {
       ai.think(allSnakesForPerception, dt);
-      ai.move(dt);
+      ai.move(dt, false);
     }
   }
 
